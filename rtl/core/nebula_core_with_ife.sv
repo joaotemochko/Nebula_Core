@@ -20,7 +20,7 @@ module nebula_core #(
     input  logic block_valid,
     input  logic [3:0][31:0] block_data_in,
     output logic commit_ready,
-    output logic [63:0] regfile_out [31:0],
+    output logic [XLEN-1:0] regfile_out [0:31],
     output logic busy,
     input wire rst_n,
     
@@ -434,77 +434,79 @@ end
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         // Reset all registers
-        pc = PC_RESET;
+        pc <= PC_RESET;
         pipeline_state <= STAGE_RESET;
-        fetch_valid0 = 0;
-        fetch_valid1 = 0;
-        fetched_instr0 = '0;
-        fetched_instr1 = '0;
-        debug_ack = 0;
-        debug_halted = 0;
-        cycles = 0;
-        inst_retired = 0;
+        fetch_valid0 <= 0;
+        fetch_valid1 <= 0;
+        fetched_instr0 <= '0;
+        fetched_instr1 <= '0;
+        execute_result0 <= '0;
+        execute_result1 <= '0;
+        debug_ack <= 0;
+        debug_halted <= 0;
+        cycles <= 0;
+        inst_retired <= 0;
+
         for (int i = 0; i < 32; i++) begin
-            regfile[i] = 0;
+            regfile[i] <= 0;
         end
 
-        imem_ack_in = 0; 
-        imem_error_in = 0;
+        imem_ack_in <= 0; 
+        imem_error_in <= 0;
 
         // CSR reset
-        csr_mstatus = '0;
-        csr_mtvec = MTVEC_DEFAULT;
-        csr_mepc = '0;
-        csr_mcause = '0;
-        csr_mtval = '0;
-        csr_mie = '0;
-        csr_mip = '0;
-        csr_mscratch = '0;
-        csr_mcycle = '0;
-        csr_minstret = '0;
-        csr_misa = (1 << 12) | (1 << 8) | (1 << 18) | (1 << 20);  // RV64IMSU
-        csr_satp = '0;
-        csr_stvec = '0;
-        csr_sepc = '0;
-        csr_scause = '0;
-        csr_stval = '0;
-        csr_sscratch = '0;
-        current_privilege = PRIV_MACHINE;
-        mstatus_mie = 0;
-        mstatus_mpie = 0;
-        mstatus_sie = 0;
-        mstatus_spie = 0;
+        csr_mstatus <= '0;
+        csr_mtvec <= MTVEC_DEFAULT;
+        csr_mepc <= '0;
+        csr_mcause <= '0;
+        csr_mtval <= '0;
+        csr_mie <= '0;
+        csr_mip <= '0;
+        csr_mscratch <= '0;
+        csr_mcycle <= '0;
+        csr_minstret <= '0;
+        csr_misa <= (1 << 12) | (1 << 8) | (1 << 18) | (1 << 20);  // RV64IMSU
+        csr_satp <= '0;
+        csr_stvec <= '0;
+        csr_sepc <= '0;
+        csr_scause <= '0;
+        csr_stval <= '0;
+        csr_sscratch <= '0;
+        current_privilege <= PRIV_MACHINE;
+        mstatus_mie <= 0;
+        mstatus_mpie <= 0;
+        mstatus_sie <= 0;
+        mstatus_spie <= 0;
         
         // Clear pipeline registers
-        decoded_instr_pair = '0;
-        execute_result0 = '0;
-        execute_result1 = '0;
-        memory_result0 = '0;
-        memory_result1 = '0;
-        alu0_busy = 0;
-        alu1_busy = 0;
+        decoded_instr_pair <= '0;
+        memory_result0 <= '0;
+        memory_result1 <= '0;
+        alu0_busy <= 0;
+        alu1_busy <= 0;
     end else begin
         // Performance counters
-        cycles = cycles + 1;
+        cycles <= cycles + 1;
 
         // Update pipeline state and PC
         pipeline_state <= next_pipeline_state;
+
         if (!debug_halted && !struct_hazard && next_pc != 0) begin
-            pc = next_pc;
+            pc <= next_pc;
         end
 
         // Debug interface
         if (debug_req && !debug_halted) begin
-            debug_ack = 1;
-            debug_halted = 1;
+            debug_ack <= 1;
+            debug_halted <= 1;
         end else if (!debug_req && debug_halted) begin
-            debug_halted = 0;
+            debug_halted <= 0;
         end
         
         if (block_data_in != 0) begin
-            imem_ack_in = 1'b1;
+            imem_ack_in <= 1'b1;
         end else begin
-            imem_ack_in = 1'b0;
+            imem_ack_in <= 1'b0;
         end
 
         // --------------------------
@@ -512,20 +514,20 @@ always_ff @(posedge clk or negedge rst_n) begin
         // --------------------------
         if (pipeline_state == STAGE_FETCH) begin
             if (imem_ack_in) begin
-                fetched_instr0 = {32'b0, block_data_in[{pc_block_index, 1'b0}]};
-                fetch_valid0 = !imem_error_in;
+                fetched_instr0 <= {32'b0, block_data_in[{pc_block_index, 1'b0}]};
+                fetch_valid0 <= !imem_error_in;
                 
                 if (!imem_error_in) begin
-                    fetched_instr1 = {32'b0, block_data_in[{pc_block_index, 1'b1}]};
-                    fetch_valid1 = !imem_error_in;
+                    fetched_instr1 <= {32'b0, block_data_in[{pc_block_index, 1'b1}]};
+                    fetch_valid1 <= !imem_error_in;
                 end else begin
-                    fetched_instr1 = '0;
-                    fetch_valid1 = 0;
+                    fetched_instr1 <= '0;
+                    fetch_valid1 <= 0;
                 end
 
                 if (imem_error_in) begin
-                    csr_mcause = {1'b0, 63'd1}; // Instruction access fault
-                    csr_mtval = { {XLEN-PHYS_ADDR_SIZE{1'b0}}, imem_addr};
+                    csr_mcause <= {1'b0, 63'd1}; // Instruction access fault
+                    csr_mtval <= { {XLEN-PHYS_ADDR_SIZE{1'b0}}, imem_addr};
                 end
             end
         end
@@ -534,12 +536,12 @@ always_ff @(posedge clk or negedge rst_n) begin
         // Decode Stage
         // --------------------------
         if (pipeline_state == STAGE_DECODE) begin
-            decoded_instr_pair.instr0 = decode_instr(fetched_instr0, pc);
-            decoded_instr_pair.instr1 = fetch_valid1 ? decode_instr(fetched_instr1, pc + 4) : '0;
-            decoded_instr_pair.dual_issue_valid = fetch_valid0 && fetch_valid1 && can_dual_issue(decoded_instr_pair.instr0, decoded_instr_pair.instr1);
+            decoded_instr_pair.instr0 <= decode_instr(fetched_instr0, pc);
+            decoded_instr_pair.instr1 <= fetch_valid1 ? decode_instr(fetched_instr1, pc + 4) : '0;
+            decoded_instr_pair.dual_issue_valid <= fetch_valid0 && fetch_valid1 && can_dual_issue(decoded_instr_pair.instr0, decoded_instr_pair.instr1);
             
             // Prepare reservation station entries
-            rs_data0 = '{
+            rs_data0 <= '{
                 op_type: decoded_instr_pair.instr0.is_load ? OP_LOAD : 
                         decoded_instr_pair.instr0.is_store ? OP_STORE : 
                         decoded_instr_pair.instr0.is_branch ? OP_BRANCH : 
@@ -554,8 +556,8 @@ always_ff @(posedge clk or negedge rst_n) begin
                 rd: decoded_instr_pair.instr0.rd
             };
 
-            if (decoded_instr_pair.dual_issue_valid) begin
-                rs_data1 = '{
+            if (fetch_valid1) begin
+                rs_data1 <= '{
                     op_type: decoded_instr_pair.instr1.is_load ? OP_LOAD : 
                             decoded_instr_pair.instr1.is_store ? OP_STORE : 
                             decoded_instr_pair.instr1.is_branch ? OP_BRANCH : 
@@ -577,17 +579,17 @@ always_ff @(posedge clk or negedge rst_n) begin
         // --------------------------
         if (pipeline_state == STAGE_EXECUTE) begin
             if (!alu0_busy) begin
-                execute_result0 = execute_alu(rs_data0);
-                alu0_busy = 1'b1;
+                execute_result0 <= execute_alu(rs_data0);
+                alu0_busy <= 1'b1;
             end
-            
+
             if (decoded_instr_pair.dual_issue_valid && !alu1_busy) begin
-                execute_result1 = execute_alu(rs_data1);
-                alu1_busy = 1'b1;
+                execute_result1 <= execute_alu(rs_data1);
+                alu1_busy <= 1'b1;
             end
         end else begin
-            alu0_busy = 0;
-            alu1_busy = 0;
+            alu0_busy <= 0;
+            alu1_busy <= 0;
         end
 
         // --------------------------
@@ -597,7 +599,7 @@ always_ff @(posedge clk or negedge rst_n) begin
             // Instruction 0 memory handling
             if (execute_result0.mem_we) begin
                 // Store operation
-                memory_result0 = '{
+                memory_result0 <= '{
                     data: '0,
                     rd: execute_result0.rd,
                     reg_we: 1'b0,
@@ -610,31 +612,31 @@ always_ff @(posedge clk or negedge rst_n) begin
                 // Load operation
                 if (dmem_ack_in) begin
                     case (decoded_instr_pair.instr0.funct3)
-                        3'b000: memory_result0.data = {{56{dmem_rdata0[7]}}, dmem_rdata0[7:0]};  // LB
-                        3'b001: memory_result0.data = {{48{dmem_rdata0[15]}}, dmem_rdata0[15:0]}; // LH
-                        3'b010: memory_result0.data = {{32{dmem_rdata0[31]}}, dmem_rdata0[31:0]}; // LW
-                        3'b011: memory_result0.data = dmem_rdata0;  // LD
-                        3'b100: memory_result0.data = {56'b0, dmem_rdata0[7:0]};  // LBU
-                        3'b101: memory_result0.data = {48'b0, dmem_rdata0[15:0]}; // LHU
-                        3'b110: memory_result0.data = {32'b0, dmem_rdata0[31:0]}; // LWU
-                        default: memory_result0.data = '0;
+                        3'b000: memory_result0.data <= {{56{dmem_rdata0[7]}}, dmem_rdata0[7:0]};  // LB
+                        3'b001: memory_result0.data <= {{48{dmem_rdata0[15]}}, dmem_rdata0[15:0]}; // LH
+                        3'b010: memory_result0.data <= {{32{dmem_rdata0[31]}}, dmem_rdata0[31:0]}; // LW
+                        3'b011: memory_result0.data <= dmem_rdata0;  // LD
+                        3'b100: memory_result0.data <= {56'b0, dmem_rdata0[7:0]};  // LBU
+                        3'b101: memory_result0.data <= {48'b0, dmem_rdata0[15:0]}; // LHU
+                        3'b110: memory_result0.data <= {32'b0, dmem_rdata0[31:0]}; // LWU
+                        default: memory_result0.data <= '0;
                     endcase
-                    memory_result0.reg_we = 1'b1;
-                    memory_result0.trap = dmem_error_in;
+                    memory_result0.reg_we <= 1'b1;
+                    memory_result0.trap <= dmem_error_in;
                 end
             end else begin
                 // ALU operation
-                memory_result0.rd = execute_result0.rd;
-                memory_result0.data = execute_result0.alu_result;
-                memory_result0.reg_we = execute_result0.reg_we;
-                memory_result0.trap = 1'b0;
+                memory_result0.rd <= execute_result0.rd;
+                memory_result0.data <= execute_result0.alu_result;
+                memory_result0.reg_we <= execute_result0.reg_we;
+                memory_result0.trap <= 1'b0;
             end
             
             // Instruction 1 memory handling (only if dual issue)
             if (decoded_instr_pair.dual_issue_valid) begin
                 if (execute_result1.mem_we) begin
                     // Store operation
-                    memory_result1 = '{
+                    memory_result1 <= '{
                         data: '0,
                         rd: execute_result1.rd,
                         reg_we: 1'b0,
@@ -647,24 +649,24 @@ always_ff @(posedge clk or negedge rst_n) begin
                     // Load operation
                     if (dmem_ack_in) begin
                         case (decoded_instr_pair.instr1.funct3)
-                            3'b000: memory_result1.data = {{56{dmem_rdata1[7]}}, dmem_rdata1[7:0]};  // LB
-                            3'b001: memory_result1.data = {{48{dmem_rdata1[15]}}, dmem_rdata1[15:0]}; // LH
-                            3'b010: memory_result1.data = {{32{dmem_rdata1[31]}}, dmem_rdata1[31:0]}; // LW
-                            3'b011: memory_result1.data = dmem_rdata1;  // LD
-                            3'b100: memory_result1.data = {56'b0, dmem_rdata1[7:0]};  // LBU
-                            3'b101: memory_result1.data = {48'b0, dmem_rdata1[15:0]}; // LHU
-                            3'b110: memory_result1.data = {32'b0, dmem_rdata1[31:0]}; // LWU
-                            default: memory_result1.data = '0;
+                            3'b000: memory_result1.data <= {{56{dmem_rdata1[7]}}, dmem_rdata1[7:0]};  // LB
+                            3'b001: memory_result1.data <= {{48{dmem_rdata1[15]}}, dmem_rdata1[15:0]}; // LH
+                            3'b010: memory_result1.data <= {{32{dmem_rdata1[31]}}, dmem_rdata1[31:0]}; // LW
+                            3'b011: memory_result1.data <= dmem_rdata1;  // LD
+                            3'b100: memory_result1.data <= {56'b0, dmem_rdata1[7:0]};  // LBU
+                            3'b101: memory_result1.data <= {48'b0, dmem_rdata1[15:0]}; // LHU
+                            3'b110: memory_result1.data <= {32'b0, dmem_rdata1[31:0]}; // LWU
+                            default: memory_result1.data <= '0;
                         endcase
-                        memory_result1.reg_we = 1'b1;
-                        memory_result1.trap = dmem_error_in;
+                        memory_result1.reg_we <= 1'b1;
+                        memory_result1.trap <= dmem_error_in;
                     end
                 end else begin
                     // ALU operation
-                    memory_result1.rd = execute_result1.rd;
-                    memory_result1.data = execute_result1.alu_result;
-                    memory_result1.reg_we = execute_result1.reg_we;
-                    memory_result1.trap = 1'b0;
+                    memory_result1.rd <= execute_result1.rd;
+                    memory_result1.data <= execute_result1.alu_result;
+                    memory_result1.reg_we <= execute_result1.reg_we;
+                    memory_result1.trap <= 1'b0;
                 end
             end
         end
@@ -674,45 +676,46 @@ always_ff @(posedge clk or negedge rst_n) begin
         // --------------------------
         if (pipeline_state == STAGE_WRITEBACK) begin
             // Instruction 0 writeback
-            while (memory_result0.reg_we || memory_result1.reg_we) begin
+            if (memory_result0.reg_we) begin
                if (memory_result0.reg_we && !memory_result0.trap && memory_result0.rd != 0) begin
-                    regfile[memory_result0.rd] = memory_result0.data;
-                    inst_retired = inst_retired + 1;
-                    memory_result0.reg_we = '0;
+                    regfile[memory_result0.rd] <= memory_result0.data;
+                    inst_retired <= inst_retired + 1;
+                    memory_result0.reg_we <= '0;
                 end
+            end
             
-                // Instruction 1 writeback (only if dual issue)
-                if (decoded_instr_pair.dual_issue_valid && memory_result1.reg_we && 
-                    !memory_result1.trap && memory_result1.rd != 0) begin
-                    regfile[memory_result1.rd] = memory_result1.data;
-                    inst_retired = inst_retired + 1;
-                    memory_result1.reg_we = '0;
+            // Instruction 1 writeback (only if dual issue)
+            if (memory_result1.reg_we) begin
+                if (decoded_instr_pair.dual_issue_valid && memory_result1.reg_we && !memory_result1.trap && memory_result1.rd != 0) begin
+                    regfile[memory_result1.rd] <= memory_result1.data;
+                    inst_retired <= inst_retired + 1;
+                    memory_result1.reg_we <= '0;
                 end 
             end
             
             // Handle traps
             if (memory_result0.trap) begin
-                csr_mcause = memory_result0.trap_cause;
-                csr_mtval = memory_result0.trap_value;
+                csr_mcause <= memory_result0.trap_cause;
+                csr_mtval <= memory_result0.trap_value;
             end else if (memory_result1.trap && decoded_instr_pair.dual_issue_valid) begin
-                csr_mcause = memory_result1.trap_cause;
-                csr_mtval = memory_result1.trap_value;
+                csr_mcause <= memory_result1.trap_cause;
+                csr_mtval <= memory_result1.trap_value;
             end
         end
             
         // Branch handling
         if (execute_result0.branch_taken && pipeline_state == STAGE_EXECUTE) begin
-            next_pc = execute_result0.branch_target;
+            next_pc <= execute_result0.branch_target;
         end else if (execute_result1.branch_taken && pipeline_state == STAGE_EXECUTE) begin
-            next_pc = execute_result1.branch_target;
+            next_pc <= execute_result1.branch_target;
         end else if (pipeline_state == STAGE_MEMORY) begin
-            next_pc = pc + (decoded_instr_pair.dual_issue_valid ? 8 : 4);
+            next_pc <= pc + (decoded_instr_pair.dual_issue_valid ? 8 : 4);
         end
 
         // PC alignment
         if (next_pc[1:0] != 2'b00 && !ENABLE_MISALIGNED_ACCESS) begin
-            csr_mcause = {1'b0, 63'd0};  // Instruction address misaligned
-            csr_mtval = next_pc;
+            csr_mcause <= {1'b0, 63'd0};  // Instruction address misaligned
+            csr_mtval <= next_pc;
         end
 
         // --------------------------
@@ -720,18 +723,18 @@ always_ff @(posedge clk or negedge rst_n) begin
         // --------------------------
         if (pipeline_state == STAGE_TRAP) begin
             if (interrupt_pending) begin
-                csr_mcause = interrupt_cause;
-                csr_mtval = '0;
+                csr_mcause <= interrupt_cause;
+                csr_mtval <= '0;
             end
             
-            csr_mepc = { {XLEN-PHYS_ADDR_SIZE{1'b0}}, pc };
-            mstatus_mpie = mstatus_mie;
-            mstatus_mie = 0;
-            pc = csr_mtvec[PHYS_ADDR_SIZE-1:0];
+            csr_mepc <= { {XLEN-PHYS_ADDR_SIZE{1'b0}}, pc };
+            mstatus_mpie <= mstatus_mie;
+            mstatus_mie <= 0;
+            pc <= csr_mtvec[PHYS_ADDR_SIZE-1:0];
         end else if (decoded_instr_pair.instr0.opcode == 7'b1110011 && decoded_instr_pair.instr0.funct3 == 3'b0) begin
             // MRET instruction
-            mstatus_mie = mstatus_mpie;
-            pc = csr_mepc[PHYS_ADDR_SIZE-1:0];
+            mstatus_mie <= mstatus_mpie;
+            pc <= csr_mepc[PHYS_ADDR_SIZE-1:0];
         end
     end
 end
@@ -824,9 +827,9 @@ function automatic decoded_instr_t decode_instr(input [XLEN-1:0] instr, input [X
     endcase
     
     if (result.valid) begin
-        imem_error_in = 1'b1;
+        imem_error_in <= 1'b1;
     end else begin
-        imem_error_in = 1'b0;
+        imem_error_in <= 1'b0;
     end
 
     return result;
@@ -991,7 +994,7 @@ function automatic execute_result_t execute_alu(input rs_entry_t rs_entry);
             result.branch_taken = 0;
         end
     endcase
-    
+
     return result;
 endfunction
 
@@ -1015,26 +1018,26 @@ assign debug_mem_rd = execute_result0.rd;
 logic executing;
 logic [1:0] pc_block_index;
 
-    always_ff @(posedge clk or posedge rst_n) begin
-        if (rst_n) begin
-        executing <= 0;
+always_ff @(posedge clk or posedge rst_n) begin
+    if (!rst_n) begin
+    executing <= 0;
+    pc_block_index <= 0;
+    end else begin
+    if (block_valid && !executing) begin
+        executing <= 1;
         pc_block_index <= 0;
-        end else begin
-        if (block_valid && !executing) begin
-            executing <= 1;
-            pc_block_index <= 0;
-        end else if (executing) begin
-            if (imem_ack_in) begin
-            pc_block_index <= pc_block_index + 1;
-            if (pc_block_index == 1) begin
-                executing <= 0;
-            end
-            end
+    end else if (executing) begin
+        if (imem_ack_in) begin
+        pc_block_index <= pc_block_index + 1;
+        if (pc_block_index == 1) begin
+            executing <= 0;
         end
         end
-  end
+    end
+    end
+end
 
-assign busy = executing;
+assign busy = (pipeline_state != 1);
 
 // Export to regfile
 assign regfile_out = regfile;
