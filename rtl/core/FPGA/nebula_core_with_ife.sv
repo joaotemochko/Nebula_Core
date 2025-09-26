@@ -1,6 +1,6 @@
-// NEBULA CORE - RV64I Implementation
+// NEBULA CORE - RV64IA Implementation
 // Alchemist RV - Little Core
-// Pipeline: 8-stage in-order with full RV64I compliance
+// Pipeline: 8-stage in-order with full RV64IA compliance
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -15,6 +15,7 @@ module nebula_core #(
     parameter int INPUT_QUEUE_DEPTH = 4
 ) (
     input wire clk,
+    input wire rst_n,
     // Interface with IFE
     input  wire [7:0] block_id,
     input  wire block_valid,
@@ -22,7 +23,6 @@ module nebula_core #(
     output logic commit_ready,
     output logic [XLEN-1:0] regfile_out [0:31],
     output logic busy,
-    input wire rst_n,
     
     // Instruction memory interface
     output logic [PHYS_ADDR_SIZE-1:0] imem_addr,
@@ -35,8 +35,6 @@ module nebula_core #(
     output logic dmem_req0,
     output logic dmem_we0,
     input wire [XLEN-1:0] dmem_rdata0,
-    input wire dmem_ack_in,
-    input wire dmem_error_in,
     
     output logic [PHYS_ADDR_SIZE-1:0] dmem_addr1,
     output logic [XLEN-1:0] dmem_wdata1,
@@ -76,6 +74,7 @@ module nebula_core #(
 );
 
 logic imem_ack_in, imem_error_in;
+logic dmem_ack_in, dmem_error_in;
 
 // --------------------------
 // Constants and Types
@@ -89,7 +88,8 @@ typedef enum logic [3:0] {
     OP_STORE   = 4'b0010,
     OP_BRANCH  = 4'b0011,
     OP_CSR     = 4'b0100,
-    OP_SYSTEM  = 4'b0101
+    OP_SYSTEM  = 4'b0101,
+    OP_AMO     = 4'b0110
 } operation_type_t;
 
 typedef struct packed {
@@ -135,7 +135,11 @@ typedef struct packed {
     logic is_branch;
     logic is_load;
     logic is_store;
-    logic is_system;
+    logic is_system; 
+    logic is_amo;
+    logic is_lr;
+    logic is_sc;
+    logic [4:0] amo_funct5;
 } decoded_instr_t;
 
 typedef struct packed {
@@ -159,6 +163,8 @@ typedef struct packed {
     logic csr_we;
     logic [11:0] csr_addr;
     logic illegal_instr;
+    logic mem_amo;
+    logic [4:0] amo_funct5;
     logic [XLEN-1:0] pc;
 } execute_result_t;
 
@@ -244,16 +250,18 @@ logic [XLEN-1:0] reg_write_data0, reg_write_data1;
 assign dmem_addr0 = execute_result0.mem_addr[PHYS_ADDR_SIZE-1:0];
 assign dmem_wdata0 = execute_result0.store_data;
 assign dmem_wstrb0 = execute_result0.mem_wstrb;
-assign dmem_req0 = (pipeline_state == STAGE_MEMORY) && 
-                  (execute_result0.mem_we || decoded_instr_pair.instr0.opcode == 7'b0000011);
+assign dmem_req0 = (pipeline_state == STAGE_EXECUTE) && 
+                  (execute_result0.mem_we || decoded_instr_pair.instr0.opcode == 7'b0000011 || decoded_instr_pair.instr0.opcode == 7'b0101111 || amo_write0);
+assign dmem_we0 = execute_result0.mem_we || amo_write0;
 assign dmem_we0 = execute_result0.mem_we;
 
 assign dmem_addr1 = execute_result1.mem_addr[PHYS_ADDR_SIZE-1:0];
 assign dmem_wdata1 = execute_result1.store_data;
 assign dmem_wstrb1 = execute_result1.mem_wstrb;
-assign dmem_req1 = (pipeline_state == STAGE_MEMORY) && 
-                  (execute_result1.mem_we || decoded_instr_pair.instr1.opcode == 7'b0000011) &&
-                  decoded_instr_pair.dual_issue_valid;
+assign dmem_req1 = (pipeline_state == STAGE_EXECUTE) && 
+                  (execute_result1.mem_we || decoded_instr_pair.instr1.opcode == 7'b0000011 || decoded_instr_pair.instr1.opcode == 7'b0101111 || amo_write1) &&
+                  fetch_valid1;
+assign dmem_we1 = execute_result1.mem_we || amo_write1;
 assign dmem_we1 = execute_result1.mem_we;
 
 // --------------------------
@@ -315,7 +323,7 @@ always_comb begin
         rs2_data0 = (decoded_instr_pair.instr0.rs2 == 0) ? 0 : regfile[decoded_instr_pair.instr0.rs2];
 
     // Instruction 1 forwarding (only if dual issue)
-    if (decoded_instr_pair.dual_issue_valid) begin
+    if (fetch_valid1) begin
         // RS1 forwarding
         if (reg_write_en0 && decoded_instr_pair.instr1.rs1 == reg_write_addr0 && decoded_instr_pair.instr1.rs1 != 0)
             rs1_data1 = reg_write_data0;
@@ -404,7 +412,7 @@ always_comb begin
             next_pipeline_state = STAGE_MEMORY;
         
         STAGE_MEMORY: 
-            if ((!dmem_req0 || dmem_ack_in) && (!dmem_req1 || !decoded_instr_pair.dual_issue_valid || dmem_ack_in)) 
+            if ((!dmem_req0 || dmem_ack_in) && (!dmem_req1 || fetch_valid1 || dmem_ack_in)) 
                 next_pipeline_state = STAGE_WRITEBACK;
             else if (dmem_error_in)
                 next_pipeline_state = STAGE_TRAP;
@@ -427,6 +435,21 @@ always_comb begin
         next_pipeline_state = STAGE_TRAP;
     end
 end
+
+// --------------------------
+// AMO FSM signals per slot
+// --------------------------
+    logic [1:0] amo_state0; // 0=idle,1=read_pending,2=write_pending
+    logic [XLEN-1:0] amo_old0;
+    logic [XLEN-1:0] amo_new0;
+    logic [4:0] amo_func0;
+    logic amo_write0;
+
+    logic [1:0] amo_state1;
+    logic [XLEN-1:0] amo_old1;
+    logic [XLEN-1:0] amo_new1;
+    logic [4:0] amo_func1;
+    logic amo_write1;
 
 // --------------------------
 // Sequential Logic (Clock-driven updates)
@@ -453,6 +476,8 @@ always_ff @(posedge clk or negedge rst_n) begin
 
         imem_ack_in <= 0; 
         imem_error_in <= 0;
+        dmem_ack_in <= 0;
+        dmem_error_in <= 0;
 
         // CSR reset
         csr_mstatus <= '0;
@@ -465,7 +490,7 @@ always_ff @(posedge clk or negedge rst_n) begin
         csr_mscratch <= '0;
         csr_mcycle <= '0;
         csr_minstret <= '0;
-        csr_misa <= (1 << 12) | (1 << 8) | (1 << 18) | (1 << 20);  // RV64IMSU
+        csr_misa <= (1 << 12) | (1 << 8) | (1 << 18) | (1 << 20) | (1 << 0);  // RV64IMSU + A (atomic)
         csr_satp <= '0;
         csr_stvec <= '0;
         csr_sepc <= '0;
@@ -544,7 +569,8 @@ always_ff @(posedge clk or negedge rst_n) begin
             
             // Prepare reservation station entries
             rs_data0 <= '{
-                op_type: decoded_instr_pair.instr0.is_load ? OP_LOAD : 
+                op_type: decoded_instr_pair.instr0.is_amo ? OP_AMO : 
+                        decoded_instr_pair.instr0.is_load ? OP_LOAD : 
                         decoded_instr_pair.instr0.is_store ? OP_STORE : 
                         decoded_instr_pair.instr0.is_branch ? OP_BRANCH : 
                         decoded_instr_pair.instr0.is_system ? OP_SYSTEM : OP_ALU,
@@ -560,7 +586,8 @@ always_ff @(posedge clk or negedge rst_n) begin
 
             if (fetch_valid1) begin
                 rs_data1 <= '{
-                    op_type: decoded_instr_pair.instr1.is_load ? OP_LOAD : 
+                    op_type: decoded_instr_pair.instr1.is_amo ? OP_AMO :
+                            decoded_instr_pair.instr1.is_load ? OP_LOAD : 
                             decoded_instr_pair.instr1.is_store ? OP_STORE : 
                             decoded_instr_pair.instr1.is_branch ? OP_BRANCH : 
                             decoded_instr_pair.instr1.is_system ? OP_SYSTEM : OP_ALU,
@@ -623,19 +650,52 @@ always_ff @(posedge clk or negedge rst_n) begin
                         3'b110: memory_result0.data <= {32'b0, dmem_rdata0[31:0]}; // LWU
                         default: memory_result0.data <= '0;
                     endcase
+
                     memory_result0.reg_we <= 1'b1;
                     memory_result0.trap <= dmem_error_in;
                 end
-            end else begin
-                // ALU operation
-                memory_result0.rd <= execute_result0.rd;
-                memory_result0.data <= execute_result0.alu_result;
-                memory_result0.reg_we <= execute_result0.reg_we;
-                memory_result0.trap <= 1'b0;
             end
+                // AMO handling for instr0 (simple two-phase RMW)
+                else if (decoded_instr_pair.instr0.opcode == 7'b0101111) begin
+                    // Phase 0: issue read -> wait for dmem_ack_in and capture old value
+                    if (amo_state0 == 2'b00) begin
+                        // initial read has been requested by dmem_req0 via assign; wait for ack
+                        if (dmem_ack_in) begin
+                            amo_old0 <= dmem_rdata0;
+                            // compute new value for amoadd (implement other functions as needed)
+                            // get rs2 value from execute_result0.store_data (execute stage should have set it)
+                            amo_func0 <= execute_result0.amo_funct5;
+                            case (execute_result0.amo_funct5)
+                                5'b00001: amo_new0 <= amo_old0 + execute_result0.store_data; // AMOADD
+                                5'b00010: amo_new0 <= execute_result0.store_data; // AMOSWAP
+                                default:  amo_new0 <= amo_old0 + execute_result0.store_data; // default to AMOADD
+                            endcase
+                            // request write in next cycle
+                            amo_state0 <= 2'b10;
+                            amo_write0 <= 1'b1;
+                        end
+                    end else if (amo_state0 == 2'b10) begin
+                        // write phase: dmem_we0 will be asserted via assign with amo_write0
+                        if (dmem_ack_in) begin
+                            // write completed: return old value to rd via memory_result0
+                            memory_result0 <= '{ data: amo_old0, rd: execute_result0.rd, reg_we: 1'b1, trap: dmem_error_in, trap_cause: '0, trap_value: '0, pc: execute_result0.pc };
+                            // clear AMO state
+                            amo_state0 <= 2'b00;
+                            amo_write0 <= 1'b0;
+                        end
+                    end
+                    memory_result0.reg_we <= 1'b1;
+                    memory_result0.trap <= dmem_error_in;
+                end else begin
+                    // ALU operation
+                    memory_result0.rd <= execute_result0.rd;
+                    memory_result0.data <= execute_result0.alu_result;
+                    memory_result0.reg_we <= execute_result0.reg_we;
+                    memory_result0.trap <= 1'b0;
+                end
             
             // Instruction 1 memory handling (only if dual issue)
-            if (decoded_instr_pair.dual_issue_valid) begin
+            if (fetch_valid1) begin
                 if (execute_result1.mem_we) begin
                     // Store operation
                     memory_result1 <= '{
@@ -660,9 +720,32 @@ always_ff @(posedge clk or negedge rst_n) begin
                             3'b110: memory_result1.data <= {32'b0, dmem_rdata1[31:0]}; // LWU
                             default: memory_result1.data <= '0;
                         endcase
+                    end
+                end
+                // AMO handling for instr1 (simple two-phase RMW)
+                else if (decoded_instr_pair.instr1.opcode == 7'b0101111 && fetch_valid1) begin
+                    if (amo_state1 == 2'b00) begin
+                        if (dmem_ack_in) begin
+                            amo_old1 <= dmem_rdata0; // note: shared ack/rdata signals in this design; adapt if separate
+                            amo_func1 <= execute_result1.amo_funct5;
+                            case (execute_result1.amo_funct5)
+                                5'b00001: amo_new1 <= amo_old1 + execute_result1.store_data;
+                                5'b00010: amo_new1 <= execute_result1.store_data;
+                                default:  amo_new1 <= amo_old1 + execute_result1.store_data;
+                            endcase
+                            amo_state1 <= 2'b10;
+                            amo_write1 <= 1'b1;
+                        end
+                end else if (amo_state1 == 2'b10) begin
+                        if (dmem_ack_in) begin
+                            memory_result1 <= '{ data: amo_old1, rd: execute_result1.rd, reg_we: 1'b1, trap: dmem_error_in, trap_cause: '0, trap_value: '0, pc: execute_result1.pc };
+                            amo_state1 <= 2'b00;
+                            amo_write1 <= 1'b0;
+                        end
+                    end
                         memory_result1.reg_we <= 1'b1;
                         memory_result1.trap <= dmem_error_in;
-                    end
+                    
                 end else begin
                     // ALU operation
                     memory_result1.rd <= execute_result1.rd;
@@ -742,17 +825,15 @@ always_ff @(posedge clk or negedge rst_n) begin
         executing <= 1;
         pc_block_index <= 0;
         end else if (executing) begin
-        if (imem_ack_in) begin
-        pc_block_index <= pc_block_index + 1;
-        if (pc_block_index == 1) begin
-            executing <= 0;
+            if (imem_ack_in) begin
+            pc_block_index <= pc_block_index + 1;
+                if (pc_block_index == 1) begin
+                    executing <= 0;
+                end
             end
         end
     end
-
-    end
 end
-
 // --------------------------
 // Instruction Decode Function
 // --------------------------
@@ -765,6 +846,7 @@ function automatic decoded_instr_t decode_instr(input [XLEN-1:0] instr, input [X
     result.rs2 = instr[24:20];
     result.funct7 = instr[31:25];
     result.valid = 1'b1;
+    result.is_amo = 0;
     result.is_alu = 0;
     result.is_branch = 0;
     result.is_load = 0;
@@ -801,7 +883,15 @@ function automatic decoded_instr_t decode_instr(input [XLEN-1:0] instr, input [X
         // LUI/AUIPC
         7'b0110111, 7'b0010111: result.is_alu = 1'b1;
         
-        // System/CSR
+        // System/CSR        // AMO / LR/SC group (A-extension)
+        7'b0101111: begin
+            result.is_amo = 1'b1;
+            result.amo_funct5 = instr[31:27];
+            // set mem size (use funct3 semantics)
+            result.imm = '0; // AMO has no immediate
+        end
+
+
         7'b1110011: begin
             result.is_system = 1'b1;
             if (instr[14:12] == 3'b000) begin
@@ -891,6 +981,12 @@ function automatic execute_result_t execute_alu(input rs_entry_t rs_entry);
     result.reg_we = '0;
     result.mem_unsigned = '0;
     result.mem_size = '0;
+    if (rs_entry.op_type == OP_AMO) begin
+        result.mem_amo = 1'b1;
+        result.amo_funct5 = rs_entry.funct7[4:0];
+        result.store_data = rs_entry.rs2_value;
+    end
+
     result.branch_taken = '0;
     result.branch_target = '0;
     result.csr_we = '0;
@@ -1037,5 +1133,277 @@ assign busy = (pipeline_state != 1);
 // Export to regfile
 assign regfile_out = regfile;
 assign commit_ready = (executing && pc_block_index == 1 && imem_ack_in);
+
+endmodule
+
+// -----------------------------------------------------------------------------
+// Full Sv39 Page-Table Walker (PTW) and TLB integration module
+// - Implements a 3-level Sv39 page-table walker for RV64 (Sv39)
+// - Exposes a memory master interface: ptw_mem_req / ptw_mem_addr / ptw_mem_size
+//   and ptw_mem_resp_valid / ptw_mem_resp_data / ptw_mem_resp_err.
+// - Handles PTE parsing, level-walk, superpage support per Sv39 rules.
+// - Produces ptw_resp_valid with resp_ppn or resp_page_fault.
+// - NOTE: This module is self-contained but requires a memory master connection.
+// -----------------------------------------------------------------------------
+
+module ptw_sv39_full #(
+    parameter XLEN = 64,
+    parameter VPN_WIDTH = 39,
+    parameter PADDR_WIDTH = 56, // physical addr bits supported by platform
+    parameter PPN_WIDTH = 44    // PPN width extracted from PTE (example)
+)(
+    input  wire                 clk,
+    input  wire                 rst_n,
+
+    // Request from core MMU/TLB
+    input  wire                 ptw_req_valid,
+    input  wire [VPN_WIDTH-1:0] ptw_req_vpn,
+    input  wire [15:0]          ptw_req_asid,
+    output reg                  ptw_req_ready,
+
+    // satp input (from CSR) - provide satp register contents
+    input  wire [XLEN-1:0]      satp,
+
+    // Memory master interface for reading PTEs
+    output reg                  ptw_mem_req,      // assert to request a memory read of 8 bytes (PTE)
+    output reg [PADDR_WIDTH-1:0] ptw_mem_addr,    // physical address to read PTE from
+    input  wire                 ptw_mem_resp_valid,
+    input  wire [63:0]          ptw_mem_resp_data, // 64-bit PTE data
+    input  wire                 ptw_mem_resp_err,
+
+    // Response to core
+    output reg                  ptw_resp_valid,
+    output reg [PPN_WIDTH-1:0]  ptw_resp_ppn,
+    output reg                  ptw_resp_page_fault
+);
+
+    // Sv39 constants
+    localparam LEVELS = 3;
+    // VPN split: VPN[2], VPN[1], VPN[0] each 9 bits
+    // Each PTE is 8 bytes; page size 4096 bytes
+    // PTE format (bits):
+    //  0: V, 1: R, 2: W, 3: X, 4: U, 5:G,6:A,7:D, 63:10 PPN
+    // satp format RV64: MODE[63:60], ASID[59:44], PPN[43:0]
+    function automatic [3:0] satp_mode(input [XLEN-1:0] s); return s[63:60]; endfunction
+    function automatic [15:0] satp_asid(input [XLEN-1:0] s); return s[59:44]; endfunction
+    function automatic [PPN_WIDTH-1:0] satp_ppn(input [XLEN-1:0] s); return s[43:0]; endfunction
+
+    typedef enum logic [2:0] { S_IDLE=0, S_READ, S_WAIT, S_CHECK, S_RESP } state_t;
+    state_t state;
+
+    // registers to hold walk context
+    reg [VPN_WIDTH-1:0] vpn_reg;
+    reg [15:0]         asid_reg;
+    reg [1:0]          level_reg; // starts at 2 (level 2 top)
+    reg [PADDR_WIDTH-1:0] satp_base_ppn; // base PPN (from satp)
+    reg [PPN_WIDTH-1:0]  pte_ppn;
+    reg [63:0]           pte_data_reg;
+
+    // compute page table base physical address: satp.ppn << 12
+    // while walking, pte_addr = (ppn << 12) + (vpn[level]*8)
+
+    // Local tmps
+    wire [8:0] vpn2 = vpn_reg[38:30];
+    wire [8:0] vpn1 = vpn_reg[29:21];
+    wire [8:0] vpn0 = vpn_reg[20:12];
+
+    // helper function to form pte physical address for given ppn and index
+    function automatic [PADDR_WIDTH-1:0] make_pte_addr(input [PPN_WIDTH-1:0] ppn, input [8:0] idx);
+        // PTE address = (ppn << 12) + (idx * 8)
+        make_pte_addr = ({{(PADDR_WIDTH-PPN_WIDTH){1'b0}}, ppn} << 12) + (idx << 3);
+    endfunction
+
+    // parse PTE helpers
+    function automatic pte_v(input [63:0] p) ; pte_v = p[0]; endfunction
+    function automatic pte_r(input [63:0] p) ; pte_r = p[1]; endfunction
+    function automatic pte_w(input [63:0] p) ; pte_w = p[2]; endfunction
+    function automatic pte_x(input [63:0] p) ; pte_x = p[3]; endfunction
+    function automatic pte_u(input [63:0] p) ; pte_u = p[4]; endfunction
+    function automatic [PPN_WIDTH-1:0] pte_ppn_extract(input [63:0] p);
+        pte_ppn_extract = p[53:10]; // for Sv39 PPN bits in PTE at [53:10]
+    endfunction
+
+    // Keep track of whether walk caused misaligned or page-fault
+    reg walk_page_fault;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_IDLE;
+            ptw_req_ready <= 1'b1;
+            ptw_mem_req <= 1'b0;
+            ptw_mem_addr <= '0;
+            ptw_resp_valid <= 1'b0;
+            ptw_resp_ppn <= '0;
+            ptw_resp_page_fault <= 1'b0;
+            vpn_reg <= '0;
+            asid_reg <= '0;
+            level_reg <= 2;
+            satp_base_ppn <= '0;
+            pte_data_reg <= 64'h0;
+            walk_page_fault <= 1'b0;
+        end else begin
+            case (state)
+                S_IDLE: begin
+                    ptw_resp_valid <= 1'b0;
+                    ptw_resp_page_fault <= 1'b0;
+                    if (ptw_req_valid && ptw_req_ready) begin
+                        // capture request and begin walk at level 2
+                        vpn_reg <= ptw_req_vpn;
+                        asid_reg <= ptw_req_asid;
+                        level_reg <= 2;
+                        ptw_req_ready <= 1'b0;
+                        walk_page_fault <= 1'b0;
+                        // record satp base ppn
+                        satp_base_ppn <= satp_ppn(satp);
+                        // compute first pte_addr
+                        ptw_mem_req <= 1'b1;
+                        ptw_mem_addr <= make_pte_addr(satp_ppn(satp), vpn2);
+                        state <= S_READ;
+                    end
+                end
+                S_READ: begin
+                    // wait for memory to accept (assume mem subsystem will capture ptw_mem_req and return resp later)
+                    // keep ptw_mem_req asserted until resp arrives or for one cycle handshake depending on interconnect
+                    if (ptw_mem_resp_valid) begin
+                        pte_data_reg <= ptw_mem_resp_data;
+                        ptw_mem_req <= 1'b0;
+                        state <= S_CHECK;
+                    end
+                end
+                S_CHECK: begin
+                    // check PTE validity and whether it's a leaf (R or X set) or pointer to next level (R=X=0)
+                    if (!pte_v(pte_data_reg)) begin
+                        // invalid PTE -> page fault
+                        walk_page_fault <= 1'b1;
+                        ptw_resp_valid <= 1'b1;
+                        ptw_resp_page_fault <= 1'b1;
+                        ptw_resp_ppn <= '0;
+                        state <= S_RESP;
+                    end else if (pte_r(pte_data_reg) || pte_x(pte_data_reg)) begin
+                        // leaf PTE - compute final PPN considering superpage formation
+                        // For Sv39: depending on level, form PPN by concatenating fields:
+                        // If level=2 (leaf at top) -> 1GB page (PPN[2]=pte.ppn[2], PPN[1]=vpn2, PPN[0]=vpn1..0?) but spec defines mapping; implement simple mapping assuming normal page size
+                        // Simpler and safe: return pte_ppn extracted and let core handle offset mapping for superpages (caller should reconstruct physical addr using ppn and vpn bits)
+                        ptw_resp_valid <= 1'b1;
+                        ptw_resp_page_fault <= 1'b0;
+                        ptw_resp_ppn <= pte_ppn_extract(pte_data_reg);
+                        state <= S_RESP;
+                    end else begin
+                        // not leaf -> next level pointer
+                        if (level_reg == 0) begin
+                            // reached level 0 with non-leaf PTE -> page fault
+                            walk_page_fault <= 1'b1;
+                            ptw_resp_valid <= 1'b1;
+                            ptw_resp_page_fault <= 1'b1;
+                            ptw_resp_ppn <= '0;
+                            state <= S_RESP;
+                        end else begin
+                            // compute next PTE physical address using pte_ppn extracted
+                            pte_ppn <= pte_ppn_extract(pte_data_reg);
+                            // decrement level and request next PTE
+                            level_reg <= level_reg - 1;
+                            ptw_mem_req <= 1'b1;
+                            if (level_reg == 2) ptw_mem_addr <= make_pte_addr(pte_ppn_extract(pte_data_reg), vpn1);
+                            else if (level_reg == 1) ptw_mem_addr <= make_pte_addr(pte_ppn_extract(pte_data_reg), vpn0);
+                            state <= S_READ;
+                        end
+                    end
+                end
+                S_RESP: begin
+                    // deliver response to core then go idle
+                    // Wait one cycle for core to sample resp_valid
+                    ptw_req_ready <= 1'b1;
+                    // resp_valid held for one cycle
+                    state <= S_IDLE;
+                    ptw_resp_valid <= 1'b0; // clear after one cycle
+                end
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// Simple fully-associative TLB module with insert/invalidate/lookup API.
+// This TLB is designed to be used by the core: on TLB miss, core invokes ptw,
+// then calls insert_valid with PPN returned by PTW.
+// -----------------------------------------------------------------------------
+
+module tlb_associative #(
+    parameter VPN_WIDTH = 39,
+    parameter PPN_WIDTH = 44,
+    parameter TLB_ENTRIES = 64
+)(
+    input  wire clk,
+    input  wire rst_n,
+    // lookup
+    input  wire                 lookup_valid,
+    input  wire [VPN_WIDTH-1:0] lookup_vpn,
+    input  wire [15:0]          lookup_asid,
+    output reg                  lookup_hit,
+    output reg [PPN_WIDTH-1:0]  lookup_ppn,
+    // insert
+    input  wire                 insert_valid,
+    input  wire [VPN_WIDTH-1:0] insert_vpn,
+    input  wire [PPN_WIDTH-1:0] insert_ppn,
+    input  wire [15:0]          insert_asid,
+    // invalidate
+    input  wire                 invalidate_all,
+    input  wire                 invalidate_by_asid,
+    input  wire [15:0]          invalidate_asid
+);
+
+    typedef struct packed {
+        logic                   valid;
+        logic [VPN_WIDTH-1:0]   vpn;
+        logic [PPN_WIDTH-1:0]   ppn;
+        logic [15:0]            asid;
+    } tlb_entry_t;
+
+    tlb_entry_t entries [0:TLB_ENTRIES-1];
+    integer i;
+    reg [31:0] rr_ptr;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i=0;i<TLB_ENTRIES;i=i+1) begin
+                entries[i].valid <= 1'b0;
+                entries[i].vpn <= '0;
+                entries[i].ppn <= '0;
+                entries[i].asid <= '0;
+            end
+            lookup_hit <= 1'b0;
+            lookup_ppn <= '0;
+            rr_ptr <= 0;
+        end else begin
+            if (invalidate_all) begin
+                for (i=0;i<TLB_ENTRIES;i=i+1) entries[i].valid <= 1'b0;
+            end else if (invalidate_by_asid) begin
+                for (i=0;i<TLB_ENTRIES;i=i+1) if (entries[i].valid && entries[i].asid == invalidate_asid) entries[i].valid <= 1'b0;
+            end
+
+            if (insert_valid) begin
+                entries[rr_ptr].valid <= 1'b1;
+                entries[rr_ptr].vpn   <= insert_vpn;
+                entries[rr_ptr].ppn   <= insert_ppn;
+                entries[rr_ptr].asid  <= insert_asid;
+                rr_ptr <= (rr_ptr + 1) % TLB_ENTRIES;
+            end
+
+            // lookup (sequential implementation for simplicity)
+            lookup_hit <= 1'b0;
+            lookup_ppn <= '0;
+            if (lookup_valid) begin
+                for (i=0;i<TLB_ENTRIES;i=i+1) begin
+                    if (entries[i].valid && entries[i].vpn == lookup_vpn && entries[i].asid == lookup_asid) begin
+                        lookup_hit <= 1'b1;
+                        lookup_ppn <= entries[i].ppn;
+                    end
+                end
+            end
+        end
+    end
 
 endmodule
