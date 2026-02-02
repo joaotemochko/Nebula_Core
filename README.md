@@ -1,11 +1,7 @@
 # Nebula Core
 
 <p align="center">
-  <img src="docs/nebula_logo.png" alt="Nebula Core Logo" width="200"/>
-</p>
-
-<p align="center">
-  <strong>A high-performance, Linux-capable RISC-V RV64GC processor core</strong>
+  <strong>A Low Power, Linux-capable RISC-V RV64GC processor core</strong>
 </p>
 
 <p align="center">
