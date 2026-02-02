@@ -72,6 +72,7 @@ module nebula_frontend_rvc #(
     input  wire                     itlb_hit,
     input  wire [PPN_WIDTH-1:0]     itlb_ppn,
     input  wire                     itlb_page_fault,
+    input  wire                     itlb_access_fault,
     
     // =========================================================================
     // PTW Interface
@@ -81,6 +82,7 @@ module nebula_frontend_rvc #(
     input  wire                     ptw_ready,
     input  wire                     ptw_resp_valid,
     input  wire                     ptw_page_fault,
+    input  wire                     ptw_access_fault,
     
     // =========================================================================
     // Control
@@ -100,8 +102,10 @@ module nebula_frontend_rvc #(
     // Constants
     // =========================================================================
     
-    localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_8000_0000;
+    // localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_8000_0000;
     
+    localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_0000_0000;
+
     // =========================================================================
     // Fetch Buffer
     // =========================================================================
@@ -547,9 +551,7 @@ module nebula_frontend_rvc #(
     assign ptw_vpn = fetch_pc[VADDR_WIDTH-1:12];
     
     // Exception signals
-    assign fetch_exception = (state == S_EXCEPTION);
-    assign fetch_exception_cause = itlb_page_fault || ptw_page_fault ? 
-                                   EXC_INSTR_PAGE_FAULT : EXC_INSTR_ACCESS_FAULT;
+    assign fetch_exception_cause = (itlb_page_fault || ptw_page_fault) ? EXC_INSTR_PAGE_FAULT : EXC_INSTR_ACCESS_FAULT;
     assign fetch_exception_value = {{(XLEN-VADDR_WIDTH){pc_reg[VADDR_WIDTH-1]}}, pc_reg};
     
     // =========================================================================
@@ -557,7 +559,7 @@ module nebula_frontend_rvc #(
     // =========================================================================
     
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+        if (rst_n) begin
             state <= S_RESET;
             pc_reg <= RESET_VECTOR;
             fetch_buffer <= '0;

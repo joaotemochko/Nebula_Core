@@ -324,6 +324,9 @@ module dcache_l1 #(
     // =========================================================================
     
     always_comb begin
+        logic found_dirty;
+        found_dirty = 1'b0;
+
         next_state = state;
         
         case (state)
@@ -380,8 +383,6 @@ module dcache_l1 #(
             
             S_FLUSH_SCAN: begin
                 // Procurar próxima linha dirty
-                logic found_dirty;
-                found_dirty = 1'b0;
                 for (int s = flush_set_idx; s < NUM_SETS && !found_dirty; s++) begin
                     for (int w = 0; w < NUM_WAYS && !found_dirty; w++) begin
                         if (tag_array[s][w].valid && tag_array[s][w].dirty)
@@ -617,6 +618,7 @@ module dcache_l1 #(
                     S_REFILL_DONE: begin
                         // Instalar nova linha
                         logic [LINE_BITS-1:0] new_line;
+                        logic [XLEN-1:0] new_word;
                         new_line = line_buffer;
                         
                         // Se é escrita, modificar a linha
@@ -633,7 +635,6 @@ module dcache_l1 #(
                                 3'd7: word_from_buffer = line_buffer[511:448];
                             endcase
                             
-                            logic [XLEN-1:0] new_word;
                             new_word = apply_wstrb(word_from_buffer, wdata_reg, wstrb_reg);
                             new_line = modify_line(line_buffer, new_word, word_offset_reg);
                         end

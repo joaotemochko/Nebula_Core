@@ -174,15 +174,15 @@ module branch_predictor #(
             ras_ptr <= '0;
             
             for (int i = 0; i < BTB_ENTRIES; i++) begin
-                btb[i].valid <= 1'b0;
+                btb[i].valid = 1'b0;
             end
             
             for (int i = 0; i < BHT_ENTRIES; i++) begin
-                bht[i] <= 2'b01;  // Weakly not taken
+                bht[i] = 2'b01;  // Weakly not taken
             end
             
             for (int i = 0; i < RAS_DEPTH; i++) begin
-                ras[i] <= '0;
+                ras[i] = '0;
             end
         end
         else begin

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 `ifndef NEBULA_PKG_SV
 `define NEBULA_PKG_SV
 

@@ -286,7 +286,7 @@ module nebula_backend_fpu #(
             end
             3'b001: begin // SLL/SLLI
                 if (issue_instr.is_alu_w)
-                    alu_result = {{32{(alu_op1[31:0] << shamt)[31]}}, (alu_op1[31:0] << shamt)};
+                    alu_result = $signed(alu_op1[31:0] << shamt[4:0]);
                 else
                     alu_result = alu_op1 << shamt;
             end

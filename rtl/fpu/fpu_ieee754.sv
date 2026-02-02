@@ -583,6 +583,9 @@ module fpu_ieee754 #(
     fflags_t simple_flags;
     
     always_comb begin
+        logic lt;
+        logic le;
+        
         simple_fp_result = '0;
         simple_int_result = '0;
         simple_flags = '0;
@@ -690,7 +693,6 @@ module fpu_ieee754 #(
                     simple_flags.NV = 1'b1;
                 end
                 else begin
-                    logic lt;
                     if (a.zero && b.zero) lt = 1'b0;
                     else if (a.sign != b.sign) lt = a.sign;
                     else if (a.sign) lt = rs1_r[62:0] > rs2_r[62:0];
@@ -705,7 +707,6 @@ module fpu_ieee754 #(
                     simple_flags.NV = 1'b1;
                 end
                 else begin
-                    logic le;
                     if (a.zero && b.zero) le = 1'b1;
                     else if (a.sign != b.sign) le = a.sign;
                     else if (a.sign) le = rs1_r[62:0] >= rs2_r[62:0];

@@ -17,7 +17,7 @@ import nebula_pkg::*;
  * - nebula_frontend_rvc (inclui compressed_decoder_rv64)
  * - nebula_backend_fpu
  */
-module nebula_core_full #(
+module nebula_core #(
     parameter int HART_ID = 0,
     parameter int XLEN = 64,
     parameter int FLEN = 64,
@@ -58,7 +58,6 @@ module nebula_core_full #(
     input  wire                     debug_req,
     output logic                    debug_halted
 );
-
     localparam int VPN_WIDTH = 27;
     localparam int PPN_WIDTH = 44;
     localparam int TLB_ENTRIES = 32;
@@ -67,6 +66,12 @@ module nebula_core_full #(
     // Internal signals
     frontend_packet_t frontend_packet;
     logic frontend_valid;
+    
+    // Sinais de Exceção do Frontend (Novos)
+    logic frontend_exc;
+    logic [5:0] frontend_exc_cause;
+    logic [XLEN-1:0] frontend_exc_value;
+
     backend_ctrl_t backend_ctrl;
     bp_prediction_t bp_prediction;
     bp_update_t bp_update;
@@ -85,17 +90,25 @@ module nebula_core_full #(
     logic [7:0] dcache_wstrb;
     logic [4:0] dcache_amo_op;
 
-    // TLB
-    logic itlb_req, itlb_hit, itlb_page_fault;
-    logic dtlb_req, dtlb_hit, dtlb_page_fault, dtlb_is_store;
+    // TLB Signals
+    logic itlb_req, itlb_hit, itlb_page_fault, itlb_access_fault;
+    logic dtlb_req, dtlb_hit, dtlb_page_fault, dtlb_is_store, dtlb_access_fault;
     logic [VPN_WIDTH-1:0] itlb_vpn, dtlb_vpn;
     logic [PPN_WIDTH-1:0] itlb_ppn, dtlb_ppn;
+    // Novos fios de update A/D e Fault VPN
+    logic itlb_need_a, itlb_need_d;
+    logic dtlb_need_a, dtlb_need_d;
+    logic [VPN_WIDTH-1:0] itlb_fault_vpn, dtlb_fault_vpn;
 
-    // PTW
-    logic ptw_req_itlb, ptw_req_dtlb, ptw_ready, ptw_resp_valid, ptw_page_fault, ptw_is_for_itlb;
-    logic [VPN_WIDTH-1:0] ptw_vpn_itlb, ptw_vpn_dtlb, ptw_vpn;
+    // PTW Signals (Expandidos)
+    logic ptw_req_itlb, ptw_req_dtlb, ptw_ready, ptw_resp_valid, ptw_page_fault, ptw_access_fault, ptw_is_for_itlb;
+    logic [VPN_WIDTH-1:0] ptw_vpn_itlb, ptw_vpn_dtlb, ptw_vpn, ptw_resp_vpn;
     logic [PPN_WIDTH-1:0] ptw_resp_ppn;
-    logic [9:0] ptw_resp_perm;
+    logic [15:0] ptw_resp_asid;
+    logic [1:0] ptw_resp_page_size;
+    logic ptw_resp_for_itlb;
+    // Permissões detalhadas do PTW
+    logic ptw_resp_r, ptw_resp_w, ptw_resp_x, ptw_resp_u, ptw_resp_g, ptw_resp_a, ptw_resp_d;
 
     // CSR
     logic csr_req, csr_fault;
@@ -186,51 +199,64 @@ module nebula_core_full #(
            .mstatus_mprv(), .mstatus_mpp(), .mstatus_spp(), .cycle_count(cycle_counter), .time_count(time_counter),
            .instret_count(instret_counter), .fflags_in(fpu_fflags), .fflags_we(fpu_resp_valid), .frm_out(csr_frm));
 
-    // ITLB
+    // ITLB (Atualizado)
     tlb_sv39 #(.TLB_ENTRIES(TLB_ENTRIES))
     u_itlb (.clk, .rst_n, .lookup_valid(itlb_req), .lookup_vpn(itlb_vpn), .lookup_asid(csr_satp[59:44]),
             .lookup_priv(current_priv), .lookup_is_store(1'b0), .lookup_is_exec(1'b1),
             .mstatus_sum(csr_mstatus[18]), .mstatus_mxr(csr_mstatus[19]),
             .lookup_hit(itlb_hit), .lookup_ppn(itlb_ppn), .lookup_page_fault(itlb_page_fault),
-            .refill_valid(ptw_resp_valid && ptw_is_for_itlb), .refill_vpn(ptw_vpn), .refill_ppn(ptw_resp_ppn),
-            .refill_perm(ptw_resp_perm), .refill_asid(csr_satp[59:44]), .refill_is_superpage(1'b0), .refill_superpage_level(2'b00),
+            .access_fault(itlb_access_fault), .need_set_a(itlb_need_a), .need_set_d(itlb_need_d), .fault_vpn(itlb_fault_vpn),
+            // Conexões de Refill do PTW
+            .insert_valid(ptw_resp_valid && ptw_is_for_itlb), .insert_vpn(ptw_resp_vpn), .insert_ppn(ptw_resp_ppn),
+            .insert_asid(ptw_resp_asid), .insert_page_size(ptw_resp_page_size),
+            .insert_r(ptw_resp_r), .insert_w(ptw_resp_w), .insert_x(ptw_resp_x), .insert_u(ptw_resp_u),
+            .insert_g(ptw_resp_g), .insert_a(ptw_resp_a), .insert_d(ptw_resp_d),
+            // Invalidação
             .invalidate_all(sfence_valid && sfence_all), .invalidate_by_asid(sfence_valid && !sfence_all && (sfence_vpn == '0)),
             .invalidate_by_addr(sfence_valid && !sfence_all && (sfence_asid == '0)),
             .invalidate_by_both(sfence_valid && !sfence_all && (sfence_vpn != '0) && (sfence_asid != '0)),
             .invalidate_asid(sfence_asid), .invalidate_vpn(sfence_vpn));
 
-    // DTLB
+    // DTLB (Atualizado)
     tlb_sv39 #(.TLB_ENTRIES(TLB_ENTRIES))
     u_dtlb (.clk, .rst_n, .lookup_valid(dtlb_req), .lookup_vpn(dtlb_vpn), .lookup_asid(csr_satp[59:44]),
             .lookup_priv(current_priv), .lookup_is_store(dtlb_is_store), .lookup_is_exec(1'b0),
             .mstatus_sum(csr_mstatus[18]), .mstatus_mxr(csr_mstatus[19]),
             .lookup_hit(dtlb_hit), .lookup_ppn(dtlb_ppn), .lookup_page_fault(dtlb_page_fault),
-            .refill_valid(ptw_resp_valid && !ptw_is_for_itlb), .refill_vpn(ptw_vpn), .refill_ppn(ptw_resp_ppn),
-            .refill_perm(ptw_resp_perm), .refill_asid(csr_satp[59:44]), .refill_is_superpage(1'b0), .refill_superpage_level(2'b00),
+            .access_fault(dtlb_access_fault), .need_set_a(dtlb_need_a), .need_set_d(dtlb_need_d), .fault_vpn(dtlb_fault_vpn),
+            // Conexões de Refill do PTW
+            .insert_valid(ptw_resp_valid && !ptw_is_for_itlb), .insert_vpn(ptw_resp_vpn), .insert_ppn(ptw_resp_ppn),
+            .insert_asid(ptw_resp_asid), .insert_page_size(ptw_resp_page_size),
+            .insert_r(ptw_resp_r), .insert_w(ptw_resp_w), .insert_x(ptw_resp_x), .insert_u(ptw_resp_u),
+            .insert_g(ptw_resp_g), .insert_a(ptw_resp_a), .insert_d(ptw_resp_d),
+            // Invalidação
             .invalidate_all(sfence_valid && sfence_all), .invalidate_by_asid(sfence_valid && !sfence_all && (sfence_vpn == '0)),
             .invalidate_by_addr(sfence_valid && !sfence_all && (sfence_asid == '0)),
             .invalidate_by_both(sfence_valid && !sfence_all && (sfence_vpn != '0) && (sfence_asid != '0)),
             .invalidate_asid(sfence_asid), .invalidate_vpn(sfence_vpn));
 
-    // PTW
+    // PTW (Atualizado)
     ptw_sv39 u_ptw (.clk, .rst_n, .ptw_req_valid(ptw_req_itlb || ptw_req_dtlb), .ptw_req_vpn(ptw_vpn),
                    .ptw_req_asid(csr_satp[59:44]), .ptw_req_is_store(dtlb_is_store && ptw_req_dtlb),
                    .ptw_req_is_exec(ptw_req_itlb && !ptw_req_dtlb), .ptw_req_for_itlb(ptw_is_for_itlb),
                    .ptw_req_ready(ptw_ready), .satp(csr_satp), .ptw_mem_req, .ptw_mem_addr,
                    .ptw_mem_resp_valid(ptw_mem_ack), .ptw_mem_resp_data(ptw_mem_data), .ptw_mem_resp_err(ptw_mem_error),
-                   .ptw_resp_valid, .ptw_resp_ppn, .ptw_resp_perm, .ptw_resp_page_fault(ptw_page_fault));
+                   .ptw_resp_valid, .ptw_resp_vpn, .ptw_resp_ppn, .ptw_resp_asid, .ptw_resp_page_size, 
+                   .ptw_resp_page_fault(ptw_page_fault), .ptw_resp_access_fault(ptw_access_fault), .ptw_resp_for_itlb,
+                   .ptw_resp_r, .ptw_resp_w, .ptw_resp_x, .ptw_resp_u, .ptw_resp_g, .ptw_resp_a, .ptw_resp_d);
 
-    // Frontend with RVC support
+    // Frontend (Atualizado)
     nebula_frontend_rvc #(.XLEN(XLEN), .VADDR_WIDTH(VADDR_WIDTH), .PADDR_WIDTH(PADDR_WIDTH), .VPN_WIDTH(VPN_WIDTH), .PPN_WIDTH(PPN_WIDTH))
     u_frontend (.clk, .rst_n, .backend_stall(backend_ctrl.stall), .backend_flush(backend_ctrl.flush),
                 .backend_redirect(backend_ctrl.redirect), .backend_redirect_pc(backend_ctrl.redirect_pc),
                 .frontend_out(frontend_packet), .frontend_valid, .fetch_pc_out(fetch_pc), .bp_prediction,
                 .icache_req, .icache_addr, .icache_ready, .icache_resp_valid, .icache_resp_data, .icache_resp_error,
-                .itlb_req, .itlb_vpn, .itlb_hit, .itlb_ppn, .itlb_page_fault,
+                .itlb_req, .itlb_vpn, .itlb_hit, .itlb_ppn, .itlb_page_fault, .itlb_access_fault,
+                .fetch_exception(frontend_exc), .fetch_exception_cause(frontend_exc_cause), .fetch_exception_value(frontend_exc_value),
                 .ptw_req(ptw_req_itlb), .ptw_vpn(ptw_vpn_itlb), .ptw_ready, .ptw_resp_valid(ptw_resp_valid && ptw_is_for_itlb),
-                .ptw_page_fault, .mmu_enabled, .current_priv);
+                .ptw_page_fault, .ptw_access_fault(ptw_access_fault), .mmu_enabled, .current_priv);
 
-    // Backend with FPU
+    // Backend (Mantido, mas agora o frontend_packet contém dados corretos)
     nebula_backend_fpu #(.XLEN(XLEN), .FLEN(FLEN), .VADDR_WIDTH(VADDR_WIDTH), .PADDR_WIDTH(PADDR_WIDTH), .VPN_WIDTH(VPN_WIDTH), .PPN_WIDTH(PPN_WIDTH))
     u_backend (.clk, .rst_n, .frontend_valid, .frontend_in(frontend_packet), .backend_ctrl, .bp_update,
                .dcache_req, .dcache_addr, .dcache_wdata, .dcache_wstrb, .dcache_we, .dcache_is_amo, .dcache_amo_op,
@@ -248,15 +274,14 @@ module nebula_core_full #(
 
     // Performance Counters
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            cycle_counter <= '0;
-            instret_counter <= '0;
-            time_counter <= '0;
-        end else begin
-            cycle_counter <= cycle_counter + 1;
-            time_counter <= time_counter + 1;
-            if (instr_retired) instret_counter <= instret_counter + (instr_retired_2 ? 2 : 1);
+            if (!rst_n) begin
+                cycle_counter <= '0;
+                instret_counter <= '0;
+                time_counter <= '0;
+            end else begin
+                cycle_counter <= cycle_counter + 1;
+                time_counter <= time_counter + 1;
+                if (instr_retired) instret_counter <= instret_counter + (instr_retired_2 ? 2 : 1);
+            end
         end
-    end
-
 endmodule

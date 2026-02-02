@@ -1,6 +1,8 @@
 `timescale 1ns/1ps
 `default_nettype none
 
+import nebula_pkg::*;
+
 /**
  * @module csr_unit
  * @brief Unidade de Control and Status Registers para RV64 Privileged
@@ -8,6 +10,7 @@
  * @details Implementa CSRs necessários para Linux:
  * - Machine Mode: mstatus, misa, mie, mip, mtvec, mscratch, mepc, mcause, mtval, medeleg, mideleg
  * - Supervisor Mode: sstatus, sie, sip, stvec, sscratch, sepc, scause, stval, satp
+ * - Floating Point: fflags, frm, fcsr
  * - Counters: cycle, time, instret (read-only em S/U mode)
  *
  * Suporta todas as instruções CSR: CSRRW, CSRRS, CSRRC, CSRRWI, CSRRSI, CSRRCI
@@ -66,18 +69,28 @@ module csr_unit #(
     // Counters input
     input  wire [63:0]          cycle_count,
     input  wire [63:0]          time_count,
-    input  wire [63:0]          instret_count
+    input  wire [63:0]          instret_count,
+
+    // Interface FPU
+    input  fflags_t             fflags_in,     // Flags vindas da FPU
+    input  wire                 fflags_we,     // Write Enable da FPU
+    output rounding_mode_t      frm_out        // Rounding mode para a FPU
 );
 
     // =========================================================================
     // Endereços CSR
     // =========================================================================
     
-    // User-level CSRs
+    // User-level CSRs (Floating Point)
+    localparam CSR_FFLAGS       = 12'h001;
+    localparam CSR_FRM          = 12'h002;
+    localparam CSR_FCSR         = 12'h003;
+
+    // User-level CSRs (Counters)
     localparam CSR_CYCLE        = 12'hC00;
     localparam CSR_TIME         = 12'hC01;
     localparam CSR_INSTRET      = 12'hC02;
-    localparam CSR_CYCLEH       = 12'hC80;  // RV32 only
+    localparam CSR_CYCLEH       = 12'hC80; // RV32 only
     localparam CSR_TIMEH        = 12'hC81;
     localparam CSR_INSTRETH     = 12'hC82;
     
@@ -92,7 +105,7 @@ module csr_unit #(
     localparam CSR_STVAL        = 12'h143;
     localparam CSR_SIP          = 12'h144;
     localparam CSR_SATP         = 12'h180;
-    
+
     // Machine-level CSRs
     localparam CSR_MSTATUS      = 12'h300;
     localparam CSR_MISA         = 12'h301;
@@ -114,12 +127,12 @@ module csr_unit #(
     localparam PRIV_M = 2'b11;
     
     // Interrupt causes
-    localparam INT_SSI = 64'd1;   // Supervisor Software Interrupt
-    localparam INT_MSI = 64'd3;   // Machine Software Interrupt
-    localparam INT_STI = 64'd5;   // Supervisor Timer Interrupt
-    localparam INT_MTI = 64'd7;   // Machine Timer Interrupt
-    localparam INT_SEI = 64'd9;   // Supervisor External Interrupt
-    localparam INT_MEI = 64'd11;  // Machine External Interrupt
+    localparam INT_SSI = 64'd1; // Supervisor Software Interrupt
+    localparam INT_MSI = 64'd3; // Machine Software Interrupt
+    localparam INT_STI = 64'd5; // Supervisor Timer Interrupt
+    localparam INT_MTI = 64'd7; // Machine Timer Interrupt
+    localparam INT_SEI = 64'd9; // Supervisor External Interrupt
+    localparam INT_MEI = 64'd11; // Machine External Interrupt
 
     // =========================================================================
     // CSR Registers
@@ -138,7 +151,7 @@ module csr_unit #(
     logic [XLEN-1:0] mcause;
     logic [XLEN-1:0] mtval;
     logic [XLEN-1:0] mcounteren;
-    
+
     // Supervisor Mode
     logic [XLEN-1:0] stvec;
     logic [XLEN-1:0] sscratch;
@@ -147,6 +160,12 @@ module csr_unit #(
     logic [XLEN-1:0] stval;
     logic [XLEN-1:0] satp;
     logic [XLEN-1:0] scounteren;
+
+    // Floating Point Mode
+    logic [4:0] fflags_reg;
+    logic [2:0] frm_reg;
+    
+    assign frm_out = rounding_mode_t'(frm_reg);
     
     // =========================================================================
     // MSTATUS field masks and positions
@@ -175,14 +194,15 @@ module csr_unit #(
     localparam MSTATUS_SXL_LO   = 34;
     localparam MSTATUS_SXL_HI   = 35;
     localparam MSTATUS_SD_BIT   = 63;
-    
+
     // sstatus mask (bits visíveis em S-mode)
-    localparam SSTATUS_MASK = (1 << MSTATUS_SIE_BIT) | (1 << MSTATUS_SPIE_BIT) |
+    localparam SSTATUS_MASK = (1 << MSTATUS_SIE_BIT) |
+                              (1 << MSTATUS_SPIE_BIT) |
                               (1 << MSTATUS_SPP_BIT) | (3 << MSTATUS_FS_LO) |
                               (3 << MSTATUS_XS_LO) | (1 << MSTATUS_SUM_BIT) |
                               (1 << MSTATUS_MXR_BIT) | (64'h3 << MSTATUS_UXL_LO) |
                               (1'b1 << MSTATUS_SD_BIT);
-    
+
     // MIP/MIE bit positions
     localparam MIP_SSIP = 1;
     localparam MIP_MSIP = 3;
@@ -295,7 +315,7 @@ module csr_unit #(
     
     assign csr_priv_level = csr_addr[9:8];
     assign csr_read_only = (csr_addr[11:10] == 2'b11);
-    
+
     always_comb begin
         csr_rdata = '0;
         csr_access_fault = 1'b0;
@@ -305,11 +325,16 @@ module csr_unit #(
             csr_access_fault = 1'b1;
         end else begin
             case (csr_addr)
+                // FPU CSRs
+                CSR_FFLAGS:  csr_rdata = {{(XLEN-5){1'b0}}, fflags_reg};
+                CSR_FRM:     csr_rdata = {{(XLEN-3){1'b0}}, frm_reg};
+                CSR_FCSR:    csr_rdata = {{(XLEN-8){1'b0}}, frm_reg, fflags_reg};
+
                 // User-level counters
                 CSR_CYCLE:   csr_rdata = cycle_count;
                 CSR_TIME:    csr_rdata = time_count;
                 CSR_INSTRET: csr_rdata = instret_count;
-                
+
                 // Supervisor CSRs
                 CSR_SSTATUS:   csr_rdata = mstatus & SSTATUS_MASK;
                 CSR_SIE:       csr_rdata = mie & mideleg;
@@ -344,8 +369,7 @@ module csr_unit #(
                 CSR_MHARTID:   csr_rdata = HART_ID;
                 
                 default: begin
-                    csr_rdata = '0;
-                    // Don't fault on unknown CSRs, just return 0
+                    csr_rdata = '0; // Don't fault on unknown CSRs, just return 0
                 end
             endcase
         end
@@ -356,12 +380,12 @@ module csr_unit #(
     // =========================================================================
     
     // CSR operation decoding
-    localparam CSR_OP_RW  = 3'b001;  // CSRRW
-    localparam CSR_OP_RS  = 3'b010;  // CSRRS
-    localparam CSR_OP_RC  = 3'b011;  // CSRRC
-    localparam CSR_OP_RWI = 3'b101;  // CSRRWI
-    localparam CSR_OP_RSI = 3'b110;  // CSRRSI
-    localparam CSR_OP_RCI = 3'b111;  // CSRRCI
+    localparam CSR_OP_RW  = 3'b001; // CSRRW
+    localparam CSR_OP_RS  = 3'b010; // CSRRS
+    localparam CSR_OP_RC  = 3'b011; // CSRRC
+    localparam CSR_OP_RWI = 3'b101; // CSRRWI
+    localparam CSR_OP_RSI = 3'b110; // CSRRSI
+    localparam CSR_OP_RCI = 3'b111; // CSRRCI
     
     logic [XLEN-1:0] csr_new_value;
     logic csr_write_enable;
@@ -398,7 +422,6 @@ module csr_unit #(
     // Determine if trap goes to M-mode or S-mode
     always_comb begin
         trap_to_m_mode = 1'b1;
-        
         if (trap_from_priv != PRIV_M) begin
             if (trap_is_interrupt) begin
                 // Interrupt delegation
@@ -497,8 +520,22 @@ module csr_unit #(
             stval <= '0;
             satp <= '0;
             scounteren <= '0;
-            
+
+            // FPU Registers
+            fflags_reg <= '0;
+            frm_reg <= '0;
+
         end else begin
+            
+            // Update FFlags from FPU Pipeline (Acumula flags)
+            if (fflags_we) begin
+                fflags_reg[0] <= fflags_reg[0] | fflags_in.NX;
+                fflags_reg[1] <= fflags_reg[1] | fflags_in.UF;
+                fflags_reg[2] <= fflags_reg[2] | fflags_in.OF;
+                fflags_reg[3] <= fflags_reg[3] | fflags_in.DZ;
+                fflags_reg[4] <= fflags_reg[4] | fflags_in.NV;
+            end
+
             // =================================================================
             // Trap Entry
             // =================================================================
@@ -552,6 +589,14 @@ module csr_unit #(
             // =================================================================
             else if (csr_write_enable) begin
                 case (csr_addr)
+                    // FPU CSRs
+                    CSR_FFLAGS: fflags_reg <= csr_new_value[4:0];
+                    CSR_FRM:    frm_reg    <= csr_new_value[2:0];
+                    CSR_FCSR: begin
+                        fflags_reg <= csr_new_value[4:0];
+                        frm_reg    <= csr_new_value[7:5];
+                    end
+
                     // Supervisor CSRs
                     CSR_SSTATUS: begin
                         mstatus <= (mstatus & ~SSTATUS_MASK) | (csr_new_value & SSTATUS_MASK);
