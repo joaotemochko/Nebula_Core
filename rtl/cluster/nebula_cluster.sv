@@ -109,7 +109,7 @@ module nebula_cluster #(
             // Hart ID = Cluster_ID * NUM_CORES + Core_Index
             localparam int HART_ID = CLUSTER_ID * NUM_CORES + c;
             
-            nebula_core #(
+            nebula_core_full #(
                 .HART_ID(HART_ID),
                 .XLEN(XLEN),
                 .PADDR_WIDTH(PADDR_WIDTH),

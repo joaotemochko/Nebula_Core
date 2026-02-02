@@ -10,6 +10,12 @@ import nebula_pkg::*;
  * @details
  * O frontend lida corretamente com mix de instruções de 16 e 32 bits:
  *
+ * Problemas resolvidos:
+ * 1. Detecção de tamanho: bits[1:0] != 2'b11 indica 16-bit
+ * 2. Alinhamento de 2 bytes (não 4)
+ * 3. Instrução de 32-bit pode cruzar boundary de halfword
+ * 4. PC avança +2 ou +4 dependendo do tamanho
+ * 5. Buffer de fetch para lidar com instruções partidas
  *
  * Fetch buffer de 64 bits (4 halfwords) para:
  * - Sempre ter pelo menos 1 instrução completa disponível
@@ -18,7 +24,7 @@ import nebula_pkg::*;
  * Pipeline:
  * [Fetch] -> [Align/Expand] -> [Decode] -> [Issue]
  */
-module nebula_frontend #(
+module nebula_frontend_rvc #(
     parameter int XLEN = 64,
     parameter int VADDR_WIDTH = 39,
     parameter int PADDR_WIDTH = 56,
