@@ -551,6 +551,7 @@ module nebula_frontend_rvc #(
     assign ptw_vpn = fetch_pc[VADDR_WIDTH-1:12];
     
     // Exception signals
+    assign fetch_exception = (state == S_EXCEPTION);
     assign fetch_exception_cause = (itlb_page_fault || ptw_page_fault) ? EXC_INSTR_PAGE_FAULT : EXC_INSTR_ACCESS_FAULT;
     assign fetch_exception_value = {{(XLEN-VADDR_WIDTH){pc_reg[VADDR_WIDTH-1]}}, pc_reg};
     

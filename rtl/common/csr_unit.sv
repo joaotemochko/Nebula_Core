@@ -66,6 +66,9 @@ module csr_unit #(
     output logic [1:0]          mstatus_mpp,     // Previous privilege (M-mode)
     output logic                mstatus_spp,     // Previous privilege (S-mode)
     
+    // Privilege level output
+    output logic [1:0]          current_priv_out,
+
     // Counters input
     input  wire [63:0]          cycle_count,
     input  wire [63:0]          time_count,
@@ -164,7 +167,11 @@ module csr_unit #(
     // Floating Point Mode
     logic [4:0] fflags_reg;
     logic [2:0] frm_reg;
-    
+
+    // Current privilege level register
+    logic [1:0] priv_reg;
+    assign current_priv_out = priv_reg;
+
     assign frm_out = rounding_mode_t'(frm_reg);
     
     // =========================================================================
@@ -195,13 +202,13 @@ module csr_unit #(
     localparam MSTATUS_SXL_HI   = 35;
     localparam MSTATUS_SD_BIT   = 63;
 
-    // sstatus mask (bits visíveis em S-mode)
-    localparam SSTATUS_MASK = (1 << MSTATUS_SIE_BIT) |
-                              (1 << MSTATUS_SPIE_BIT) |
-                              (1 << MSTATUS_SPP_BIT) | (3 << MSTATUS_FS_LO) |
-                              (3 << MSTATUS_XS_LO) | (1 << MSTATUS_SUM_BIT) |
-                              (1 << MSTATUS_MXR_BIT) | (64'h3 << MSTATUS_UXL_LO) |
-                              (1'b1 << MSTATUS_SD_BIT);
+    // sstatus mask (bits visíveis em S-mode) - use 64-bit literals
+    localparam logic [63:0] SSTATUS_MASK = (64'd1 << MSTATUS_SIE_BIT) |
+                              (64'd1 << MSTATUS_SPIE_BIT) |
+                              (64'd1 << MSTATUS_SPP_BIT) | (64'd3 << MSTATUS_FS_LO) |
+                              (64'd3 << MSTATUS_XS_LO) | (64'd1 << MSTATUS_SUM_BIT) |
+                              (64'd1 << MSTATUS_MXR_BIT) | (64'd3 << MSTATUS_UXL_LO) |
+                              (64'd1 << MSTATUS_SD_BIT);
 
     // MIP/MIE bit positions
     localparam MIP_SSIP = 1;
@@ -224,7 +231,15 @@ module csr_unit #(
     assign mstatus_spp  = mstatus[MSTATUS_SPP_BIT];
     
     assign csr_satp = satp;
-    assign csr_mstatus = mstatus;
+
+    // SD bit (bit 63) is auto-computed: SD = (FS==3) || (XS==3)
+    logic mstatus_sd;
+    assign mstatus_sd = (mstatus[MSTATUS_FS_HI:MSTATUS_FS_LO] == 2'b11) ||
+                        (mstatus[MSTATUS_XS_HI:MSTATUS_XS_LO] == 2'b11);
+
+    logic [XLEN-1:0] mstatus_read;
+    assign mstatus_read = {mstatus_sd, mstatus[62:0]};
+    assign csr_mstatus = mstatus_read;
 
     // =========================================================================
     // Interrupt Pending Logic
@@ -336,7 +351,7 @@ module csr_unit #(
                 CSR_INSTRET: csr_rdata = instret_count;
 
                 // Supervisor CSRs
-                CSR_SSTATUS:   csr_rdata = mstatus & SSTATUS_MASK;
+                CSR_SSTATUS:   csr_rdata = mstatus_read & SSTATUS_MASK;
                 CSR_SIE:       csr_rdata = mie & mideleg;
                 CSR_STVEC:     csr_rdata = stvec;
                 CSR_SCOUNTEREN: csr_rdata = scounteren;
@@ -354,7 +369,7 @@ module csr_unit #(
                 end
                 
                 // Machine CSRs
-                CSR_MSTATUS:   csr_rdata = mstatus;
+                CSR_MSTATUS:   csr_rdata = mstatus_read;
                 CSR_MISA:      csr_rdata = misa;
                 CSR_MEDELEG:   csr_rdata = medeleg;
                 CSR_MIDELEG:   csr_rdata = mideleg;
@@ -497,7 +512,7 @@ module csr_unit #(
                     1'b1,                    // F (Single-precision FP)
                     1'b0,                    // E
                     1'b1,                    // D (Double-precision FP)
-                    1'b0,                    // C (Compressed)
+                    1'b1,                    // C (Compressed)
                     1'b0,                    // B
                     1'b1};                   // A (Atomics)
             
@@ -520,6 +535,9 @@ module csr_unit #(
             stval <= '0;
             satp <= '0;
             scounteren <= '0;
+
+            // Privilege level - start in Machine mode
+            priv_reg <= PRIV_M;
 
             // FPU Registers
             fflags_reg <= '0;
@@ -545,21 +563,27 @@ module csr_unit #(
                     mepc <= trap_pc;
                     mcause <= trap_cause;
                     mtval <= trap_value;
-                    
+
                     // Update mstatus
                     mstatus[MSTATUS_MPIE_BIT] <= mstatus[MSTATUS_MIE_BIT];
                     mstatus[MSTATUS_MIE_BIT] <= 1'b0;
                     mstatus[MSTATUS_MPP_HI:MSTATUS_MPP_LO] <= trap_from_priv;
+
+                    // Switch to M-mode
+                    priv_reg <= PRIV_M;
                 end else begin
                     // Save state to S-mode CSRs
                     sepc <= trap_pc;
                     scause <= trap_cause;
                     stval <= trap_value;
-                    
+
                     // Update mstatus (sstatus view)
                     mstatus[MSTATUS_SPIE_BIT] <= mstatus[MSTATUS_SIE_BIT];
                     mstatus[MSTATUS_SIE_BIT] <= 1'b0;
                     mstatus[MSTATUS_SPP_BIT] <= trap_from_priv[0];
+
+                    // Switch to S-mode
+                    priv_reg <= PRIV_S;
                 end
             end
             
@@ -569,6 +593,8 @@ module csr_unit #(
             else if (mret_execute) begin
                 mstatus[MSTATUS_MIE_BIT] <= mstatus[MSTATUS_MPIE_BIT];
                 mstatus[MSTATUS_MPIE_BIT] <= 1'b1;
+                // Restore privilege from MPP
+                priv_reg <= mstatus_mpp;
                 mstatus[MSTATUS_MPP_HI:MSTATUS_MPP_LO] <= PRIV_U; // Set to least privileged
                 if (mstatus_mpp != PRIV_M)
                     mstatus[MSTATUS_MPRV_BIT] <= 1'b0;
@@ -580,6 +606,8 @@ module csr_unit #(
             else if (sret_execute) begin
                 mstatus[MSTATUS_SIE_BIT] <= mstatus[MSTATUS_SPIE_BIT];
                 mstatus[MSTATUS_SPIE_BIT] <= 1'b1;
+                // Restore privilege from SPP
+                priv_reg <= {1'b0, mstatus_spp};
                 mstatus[MSTATUS_SPP_BIT] <= 1'b0; // Set to U-mode
                 mstatus[MSTATUS_MPRV_BIT] <= 1'b0;
             end
@@ -626,6 +654,11 @@ module csr_unit #(
                         // Force SXL and UXL to 2 (64-bit)
                         mstatus[MSTATUS_SXL_HI:MSTATUS_SXL_LO] <= 2'b10;
                         mstatus[MSTATUS_UXL_HI:MSTATUS_UXL_LO] <= 2'b10;
+                        // SD bit is read-only (auto-computed)
+                        mstatus[MSTATUS_SD_BIT] <= 1'b0;
+                        // MPP WARL: only M(11), S(01), U(00) are valid
+                        if (csr_new_value[MSTATUS_MPP_HI:MSTATUS_MPP_LO] == 2'b10)
+                            mstatus[MSTATUS_MPP_HI:MSTATUS_MPP_LO] <= 2'b00;
                     end
                     CSR_MEDELEG:   medeleg <= csr_new_value;
                     CSR_MIDELEG:   mideleg <= csr_new_value & 64'h0222; // Only S-mode interrupts
