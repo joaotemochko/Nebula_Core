@@ -505,7 +505,7 @@ module csr_unit #(
             mideleg <= '0;
             mie <= '0;
             mip <= '0;
-            mtvec <= 64'h0000_0000_8000_0000;
+            mtvec <= 64'h0000_0000_1200_0000;
             mscratch <= '0;
             mepc <= '0;
             mcause <= '0;

@@ -102,9 +102,9 @@ module nebula_frontend_rvc #(
     // Constants
     // =========================================================================
     
-    // localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_8000_0000;
+    localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_1000_0000;
     
-    localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_0000_0000;
+    //localparam logic [VADDR_WIDTH-1:0] RESET_VECTOR = 39'h00_0000_0000;
 
     // =========================================================================
     // Fetch Buffer
@@ -557,9 +557,8 @@ module nebula_frontend_rvc #(
     // =========================================================================
     // Sequential Logic
     // =========================================================================
-    
     always_ff @(posedge clk or negedge rst_n) begin
-        if (rst_n) begin
+        if (!rst_n) begin
             state <= S_RESET;
             pc_reg <= RESET_VECTOR;
             fetch_buffer <= '0;

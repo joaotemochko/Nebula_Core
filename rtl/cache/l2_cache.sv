@@ -156,9 +156,9 @@ module l2_cache #(
                     
                     for (int s = 0; s < SETS_PER_BANK; s++) begin
                         for (int w = 0; w < NUM_WAYS; w++) begin
-                            tag_array[b][s][w] <= '0;
+                            tag_array[b][s][w] = '0;
                         end
-                        plru_bits[b][s] <= '0;
+                        plru_bits[b][s] = '0;
                     end
                 end
                 else begin
@@ -167,9 +167,9 @@ module l2_cache #(
                             // Check requests
                             for (int c = 0; c < NUM_CORES; c++) begin
                                 if (l1_req[c].valid && get_bank(l1_req[c].addr) == b[BANK_BITS-1:0]) begin
-                                    selected_core[b] <= c[$clog2(NUM_CORES)-1:0];
-                                    req_reg[b] <= l1_req[c];
-                                    state[b] <= S_TAG_CHECK;
+                                    selected_core[b] = c[$clog2(NUM_CORES)-1:0];
+                                    req_reg[b] = l1_req[c];
+                                    state[b] = S_TAG_CHECK;
                                     break;
                                 end
                             end

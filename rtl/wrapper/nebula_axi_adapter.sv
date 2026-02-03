@@ -7,17 +7,12 @@ module nebula_axi_adapter #(
     input  wire                     clk,
     input  wire                     rst_n,
 
-    // =========================================================================
-    // Interface Nebula (Nativa - Cache Lines de 512 bits)
-    // =========================================================================
-    
-    // I-Cache
+    // Interface Nebula (Cache - 512 bits)
     input  wire                     imem_req,
     input  wire [PADDR_WIDTH-1:0]   imem_addr,
     output logic                    imem_ack,
     output logic [511:0]            imem_data,
     
-    // D-Cache
     input  wire                     dmem_req,
     input  wire                     dmem_we,
     input  wire [PADDR_WIDTH-1:0]   dmem_addr,
@@ -25,25 +20,20 @@ module nebula_axi_adapter #(
     output logic                    dmem_ack,
     output logic [511:0]            dmem_rdata,
 
-    // =========================================================================
-    // Interface AXI4 (Master) - 512-bit Data Width
-    // =========================================================================
-    
-    // AXI4 Instruction Master (Read Only)
+    // Interface AXI4 (Master - 64 bits para LiteX)
     output logic [AXI_ID_WIDTH-1:0] m_axi_i_arid,
     output logic [PADDR_WIDTH-1:0]  m_axi_i_araddr,
-    output logic [7:0]              m_axi_i_arlen,   // 0 = 1 beat
-    output logic [2:0]              m_axi_i_arsize,  // 6 = 64 bytes (512 bits)
-    output logic [1:0]              m_axi_i_arburst, // 1 = INCR
+    output logic [7:0]              m_axi_i_arlen,
+    output logic [2:0]              m_axi_i_arsize,
+    output logic [1:0]              m_axi_i_arburst,
     output logic                    m_axi_i_arvalid,
     input  wire                     m_axi_i_arready,
-    input  wire [511:0]             m_axi_i_rdata,
+    input  wire [63:0]              m_axi_i_rdata,
     input  wire [1:0]               m_axi_i_rresp,
     input  wire                     m_axi_i_rlast,
     input  wire                     m_axi_i_rvalid,
     output logic                    m_axi_i_rready,
     
-    // AXI4 Data Master (Read/Write)
     output logic [AXI_ID_WIDTH-1:0] m_axi_d_awid,
     output logic [PADDR_WIDTH-1:0]  m_axi_d_awaddr,
     output logic [7:0]              m_axi_d_awlen,
@@ -51,8 +41,8 @@ module nebula_axi_adapter #(
     output logic [1:0]              m_axi_d_awburst,
     output logic                    m_axi_d_awvalid,
     input  wire                     m_axi_d_awready,
-    output logic [511:0]            m_axi_d_wdata,
-    output logic [63:0]             m_axi_d_wstrb,   // 64 bytes mask
+    output logic [63:0]             m_axi_d_wdata,
+    output logic [7:0]              m_axi_d_wstrb,
     output logic                    m_axi_d_wlast,
     output logic                    m_axi_d_wvalid,
     input  wire                     m_axi_d_wready,
@@ -67,147 +57,120 @@ module nebula_axi_adapter #(
     output logic [1:0]              m_axi_d_arburst,
     output logic                    m_axi_d_arvalid,
     input  wire                     m_axi_d_arready,
-    input  wire [511:0]             m_axi_d_rdata,
+    input  wire [63:0]              m_axi_d_rdata,
     input  wire [1:0]               m_axi_d_rresp,
     input  wire                     m_axi_d_rlast,
     input  wire                     m_axi_d_rvalid,
     output logic                    m_axi_d_rready
 );
 
-    // =========================================================================
-    // Instruction Path (Read Only)
-    // =========================================================================
-    
-    // Constantes AXI fixas
-    assign m_axi_i_arid    = '0;
-    assign m_axi_i_arlen   = 8'd0;       // 1 beat (512 bits)
-    assign m_axi_i_arsize  = 3'b110;     // 64 bytes = 512 bits
-    assign m_axi_i_arburst = 2'b01;      // INCR
-    assign m_axi_i_rready  = 1'b1;       // Sempre pronto para receber
+    typedef enum logic [3:0] {IDLE, R_ADDR, R_WAIT_DATA, R_NEXT, W_ADDR, W_DATA, W_RESP, W_NEXT} state_t;
+    state_t state;
+    logic [3:0] cnt; 
+    logic [511:0] data_buf;
 
-    typedef enum logic [1:0] {I_IDLE, I_ADDR, I_WAIT_DATA} i_state_t;
-    i_state_t i_state;
+    // Configurações AXI Fixas
+    assign m_axi_d_arid = '0; assign m_axi_d_arlen = 8'd0; assign m_axi_d_arsize = 3'b011; assign m_axi_d_arburst = 2'b01;
+    assign m_axi_d_awid = '0; assign m_axi_d_awlen = 8'd0; assign m_axi_d_awsize = 3'b011; assign m_axi_d_awburst = 2'b01;
+    assign m_axi_d_wstrb = 8'hFF; assign m_axi_d_wlast = 1'b1;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            i_state <= I_IDLE;
-            m_axi_i_arvalid <= 1'b0;
-            imem_ack <= 1'b0;
-        end else begin
-            case (i_state)
-                I_IDLE: begin
-                    imem_ack <= 1'b0;
-                    if (imem_req) begin
-                        m_axi_i_araddr <= imem_addr;
-                        m_axi_i_arvalid <= 1'b1;
-                        i_state <= I_ADDR;
-                    end
-                end
-                
-                I_ADDR: begin
-                    if (m_axi_i_arready) begin
-                        m_axi_i_arvalid <= 1'b0;
-                        i_state <= I_WAIT_DATA;
-                    end
-                end
-                
-                I_WAIT_DATA: begin
-                    if (m_axi_i_rvalid) begin
-                        imem_data <= m_axi_i_rdata;
-                        imem_ack <= 1'b1;
-                        i_state <= I_IDLE; // Request deve baixar após Ack
-                    end
-                end
-            endcase
-        end
-    end
-
-    // =========================================================================
-    // Data Path (Read / Write)
-    // =========================================================================
-
-    // Constantes AXI
-    assign m_axi_d_awid    = '0;
-    assign m_axi_d_arid    = '0;
-    assign m_axi_d_awlen   = 8'd0;
-    assign m_axi_d_arlen   = 8'd0;
-    assign m_axi_d_awsize  = 3'b110;     // 64 bytes
-    assign m_axi_d_arsize  = 3'b110;
-    assign m_axi_d_awburst = 2'b01;
-    assign m_axi_d_arburst = 2'b01;
-    
-    assign m_axi_d_wstrb   = {64{1'b1}}; // Write full cache line
-    assign m_axi_d_wlast   = 1'b1;       // Single beat
-    assign m_axi_d_bready  = 1'b1;
-    assign m_axi_d_rready  = 1'b1;
-
-    typedef enum logic [2:0] {D_IDLE, D_ADDR_R, D_WAIT_R, D_ADDR_W, D_DATA_W, D_WAIT_B} d_state_t;
-    d_state_t d_state;
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            d_state <= D_IDLE;
-            m_axi_d_arvalid <= 0;
-            m_axi_d_awvalid <= 0;
-            m_axi_d_wvalid  <= 0;
+            state <= IDLE;
+            cnt <= 0;
             dmem_ack <= 0;
+            m_axi_d_arvalid <= 0; m_axi_d_rready <= 0;
+            m_axi_d_awvalid <= 0; m_axi_d_wvalid <= 0; m_axi_d_bready <= 0;
         end else begin
-            case (d_state)
-                D_IDLE: begin
+            case (state)
+                IDLE: begin
                     dmem_ack <= 0;
+                    cnt <= 0;
                     if (dmem_req) begin
-                        if (dmem_we) begin
-                            // WRITE
-                            m_axi_d_awaddr <= dmem_addr;
-                            m_axi_d_wdata  <= dmem_wdata;
-                            m_axi_d_awvalid <= 1'b1;
-                            d_state <= D_ADDR_W;
+                        if (!dmem_we) begin 
+                            m_axi_d_araddr <= dmem_addr; 
+                            m_axi_d_arvalid <= 1;
+                            state <= R_ADDR;
                         end else begin
-                            // READ
-                            m_axi_d_araddr <= dmem_addr;
-                            m_axi_d_arvalid <= 1'b1;
-                            d_state <= D_ADDR_R;
+                            m_axi_d_awaddr <= dmem_addr;
+                            m_axi_d_awvalid <= 1;
+                            m_axi_d_wdata <= dmem_wdata[63:0];
+                            state <= W_ADDR;
                         end
                     end
                 end
 
-                // --- LEITURA ---
-                D_ADDR_R: begin
+                R_ADDR: begin
                     if (m_axi_d_arready) begin
                         m_axi_d_arvalid <= 0;
-                        d_state <= D_WAIT_R;
-                    end
-                end
-                D_WAIT_R: begin
-                    if (m_axi_d_rvalid) begin
-                        dmem_rdata <= m_axi_d_rdata;
-                        dmem_ack <= 1;
-                        d_state <= D_IDLE;
+                        m_axi_d_rready <= 1;
+                        state <= R_WAIT_DATA;
                     end
                 end
 
-                // --- ESCRITA ---
-                D_ADDR_W: begin
+                R_WAIT_DATA: begin
+                    if (m_axi_d_rvalid) begin
+                        m_axi_d_rready <= 0;
+                        data_buf[cnt*64 +: 64] <= m_axi_d_rdata;
+                        state <= R_NEXT;
+                    end
+                end
+
+                R_NEXT: begin
+                    if (cnt == 7) begin
+                        dmem_rdata <= {m_axi_d_rdata, data_buf[447:0]};
+                        dmem_ack <= 1;
+                        state <= IDLE;
+                    end else begin
+                        cnt <= cnt + 1;
+                        m_axi_d_araddr <= m_axi_d_araddr + 8;
+                        m_axi_d_arvalid <= 1;
+                        state <= R_ADDR;
+                    end
+                end
+
+                W_ADDR: begin
                     if (m_axi_d_awready) begin
                         m_axi_d_awvalid <= 0;
-                        m_axi_d_wvalid <= 1; // Send data now
-                        d_state <= D_DATA_W;
+                        m_axi_d_wvalid <= 1;
+                        state <= W_DATA;
                     end
                 end
-                D_DATA_W: begin
+                
+                W_DATA: begin
                     if (m_axi_d_wready) begin
                         m_axi_d_wvalid <= 0;
-                        d_state <= D_WAIT_B;
+                        m_axi_d_bready <= 1;
+                        state <= W_RESP;
                     end
                 end
-                D_WAIT_B: begin
+
+                W_RESP: begin
                     if (m_axi_d_bvalid) begin
+                        m_axi_d_bready <= 0;
+                        state <= W_NEXT;
+                    end
+                end
+
+                W_NEXT: begin
+                    if (cnt == 7) begin
                         dmem_ack <= 1;
-                        d_state <= D_IDLE;
+                        state <= IDLE;
+                    end else begin
+                        cnt <= cnt + 1;
+                        m_axi_d_awaddr <= m_axi_d_awaddr + 8;
+                        m_axi_d_wdata <= dmem_wdata[(cnt+1)*64 +: 64];
+                        m_axi_d_awvalid <= 1;
+                        state <= W_ADDR;
                     end
                 end
             endcase
         end
     end
+
+    // Tie-offs
+    assign m_axi_i_arid = '0; assign m_axi_i_araddr = '0; assign m_axi_i_arlen = 0;
+    assign m_axi_i_arsize = 0; assign m_axi_i_arburst = 0; assign m_axi_i_arvalid = 0;
+    assign m_axi_i_rready = 0; assign imem_ack = 0; assign imem_data = '0;
 
 endmodule
