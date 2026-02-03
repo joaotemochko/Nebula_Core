@@ -118,7 +118,7 @@ module nebula_axi_adapter #(
 
                 R_NEXT: begin
                     if (cnt == 7) begin
-                        dmem_rdata <= {m_axi_d_rdata, data_buf[447:0]};
+                        dmem_rdata <= data_buf; // All 8 beats stored in data_buf
                         dmem_ack <= 1;
                         state <= IDLE;
                     end else begin

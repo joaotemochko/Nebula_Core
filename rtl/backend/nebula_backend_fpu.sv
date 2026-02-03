@@ -129,6 +129,13 @@ module nebula_backend_fpu #(
     input  fflags_t                 fpu_fflags,
     
     // =========================================================================
+    // Frontend Exception Interface
+    // =========================================================================
+    input  wire                     frontend_exception,
+    input  wire [5:0]               frontend_exception_cause,
+    input  wire [XLEN-1:0]          frontend_exception_value,
+
+    // =========================================================================
     // Control
     // =========================================================================
     input  wire [1:0]               current_priv,
@@ -267,20 +274,23 @@ module nebula_backend_fpu #(
     
     logic [XLEN-1:0] alu_result;
     logic [XLEN-1:0] alu_op1, alu_op2;
-    logic [4:0]      shamt;
-    
+    logic [5:0]      shamt;
+
     assign alu_op1 = issue_rs1_data;
-    assign alu_op2 = (issue_instr.is_alu && issue_instr.opcode[5] == 1'b0) ? 
+    assign alu_op2 = (issue_instr.is_alu && issue_instr.opcode[5] == 1'b0) ?
                      issue_instr.imm : issue_rs2_data;
-    assign shamt = issue_instr.is_alu_w ? issue_instr.imm[4:0] : issue_instr.imm[5:0];
+    // For R-type (opcode[5]=1), shift amount comes from rs2; for I-type from immediate
+    assign shamt = issue_instr.opcode[5] ?
+                   (issue_instr.is_alu_w ? {1'b0, issue_rs2_data[4:0]} : issue_rs2_data[5:0]) :
+                   (issue_instr.is_alu_w ? {1'b0, issue_instr.imm[4:0]} : issue_instr.imm[5:0]);
     
     always_comb begin
         alu_result = '0;
         
         case (issue_instr.funct3)
             3'b000: begin // ADD/SUB/ADDI
-                if (issue_instr.funct7[5] && !issue_instr.opcode[5])
-                    alu_result = alu_op1 - alu_op2;  // SUB
+                if (issue_instr.funct7[5] && issue_instr.opcode[5])
+                    alu_result = alu_op1 - alu_op2;  // SUB (R-type, opcode[5]=1)
                 else
                     alu_result = alu_op1 + alu_op2;  // ADD/ADDI
             end
@@ -467,6 +477,8 @@ module nebula_backend_fpu #(
             S_IDLE: begin
                 if (interrupt_pending)
                     next_state = S_TRAP;
+                else if (frontend_exception)
+                    next_state = S_TRAP;
                 else if (frontend_valid && frontend_in.instr0_valid)
                     next_state = S_ISSUE;
             end
@@ -566,14 +578,17 @@ module nebula_backend_fpu #(
     // Output Signals
     // =========================================================================
     
+    // MRET/SRET flags latched from S_EXECUTE for use during S_WRITEBACK
+    logic mret_pending, sret_pending;
+
     // Backend control
     assign backend_ctrl.stall = (state != S_IDLE);
-    assign backend_ctrl.flush = (state == S_TRAP) || 
-                                (state == S_WRITEBACK && exec_branch_taken);
+    assign backend_ctrl.flush = (state == S_TRAP) ||
+                                (state == S_WRITEBACK && (exec_branch_taken || mret_pending || sret_pending));
     assign backend_ctrl.redirect = backend_ctrl.flush;
     assign backend_ctrl.redirect_pc = (state == S_TRAP) ? trap_vector[VADDR_WIDTH-1:0] :
-                                      (mret_exec) ? return_pc[VADDR_WIDTH-1:0] :
-                                      (sret_exec) ? return_pc[VADDR_WIDTH-1:0] :
+                                      (mret_pending) ? return_pc[VADDR_WIDTH-1:0] :
+                                      (sret_pending) ? return_pc[VADDR_WIDTH-1:0] :
                                       exec_branch_target;
     
     // Branch predictor update
@@ -627,8 +642,6 @@ module nebula_backend_fpu #(
     
     // Trap signals
     assign trap_enter = (state == S_TRAP);
-    assign trap_is_interrupt = interrupt_pending && (state == S_IDLE);
-    assign trap_pc = issue_instr.pc;
     assign mret_exec = (state == S_EXECUTE) && issue_instr.is_mret;
     assign sret_exec = (state == S_EXECUTE) && issue_instr.is_sret;
     
@@ -677,6 +690,10 @@ module nebula_backend_fpu #(
             mem_fp_we <= 1'b0;
             trap_cause <= '0;
             trap_value <= '0;
+            trap_pc <= '0;
+            trap_is_interrupt <= 1'b0;
+            mret_pending <= 1'b0;
+            sret_pending <= 1'b0;
             dcache_addr <= '0;
             
             // Initialize register files
@@ -693,8 +710,25 @@ module nebula_backend_fpu #(
                     mem_int_we <= 1'b0;
                     mem_fp_we <= 1'b0;
                     exec_trap <= 1'b0;
-                    
-                    if (frontend_valid && frontend_in.instr0_valid) begin
+                    trap_is_interrupt <= 1'b0;
+                    mret_pending <= 1'b0;
+                    sret_pending <= 1'b0;
+
+                    if (interrupt_pending) begin
+                        // Set trap signals BEFORE entering S_TRAP so CSR sees them
+                        trap_cause <= interrupt_cause;
+                        trap_value <= '0;
+                        trap_pc <= frontend_valid ? {{(XLEN-VADDR_WIDTH){frontend_in.instr0.pc[VADDR_WIDTH-1]}}, frontend_in.instr0.pc} : trap_pc;
+                        trap_is_interrupt <= 1'b1;
+                    end
+                    else if (frontend_exception) begin
+                        // Frontend exception (instruction page fault, access fault)
+                        trap_cause <= {58'b0, frontend_exception_cause};
+                        trap_value <= frontend_exception_value;
+                        trap_pc <= frontend_exception_value; // PC that caused the fault
+                        trap_is_interrupt <= 1'b0;
+                    end
+                    else if (frontend_valid && frontend_in.instr0_valid) begin
                         issue_instr <= frontend_in.instr0;
                         issue_valid <= 1'b1;
                         issue_rs1_data <= rs1_forwarded;
@@ -702,11 +736,6 @@ module nebula_backend_fpu #(
                         issue_frs1_data <= frs1_forwarded;
                         issue_frs2_data <= frs2_forwarded;
                         issue_frs3_data <= frs3_forwarded;
-                    end
-                    
-                    if (interrupt_pending) begin
-                        trap_cause <= interrupt_cause;
-                        trap_value <= '0;
                     end
                 end
                 
@@ -719,46 +748,64 @@ module nebula_backend_fpu #(
                     if (issue_instr.is_alu)
                         exec_result <= alu_result;
                     else if (issue_instr.is_jal || issue_instr.is_jalr)
-                        exec_result <= issue_instr.pc + (issue_instr.is_compressed ? 2 : 4);
+                        exec_result <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc} + (issue_instr.is_compressed ? 64'd2 : 64'd4);
                     else if (issue_instr.is_csr)
                         exec_result <= csr_rdata;
-                    
+
                     // Branch
                     exec_branch_taken <= branch_taken;
                     exec_branch_target <= branch_target;
-                    
+
                     // Memory address
                     exec_mem_addr <= mem_vaddr;
                     exec_store_data <= issue_rs2_data;
                     exec_fp_store_data <= issue_frs2_data;
-                    
+
                     // Physical address (when MMU disabled)
                     if (!mmu_enabled)
                         dcache_addr <= {{(PADDR_WIDTH-VADDR_WIDTH){1'b0}}, mem_vaddr};
-                    
-                    // Check for exceptions
+
+                    // Check for exceptions - set trap signals BEFORE S_TRAP
                     if (issue_instr.is_ecall) begin
                         exec_trap <= 1'b1;
+                        trap_is_interrupt <= 1'b0;
+                        trap_pc <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc};
+                        trap_value <= '0;
                         case (current_priv)
-                            PRIV_USER:       exec_trap_cause <= EXC_ECALL_U;
-                            PRIV_SUPERVISOR: exec_trap_cause <= EXC_ECALL_S;
-                            PRIV_MACHINE:    exec_trap_cause <= EXC_ECALL_M;
-                            default:         exec_trap_cause <= EXC_ECALL_M;
+                            PRIV_USER:       begin exec_trap_cause <= EXC_ECALL_U; trap_cause <= {58'b0, 6'(EXC_ECALL_U)}; end
+                            PRIV_SUPERVISOR: begin exec_trap_cause <= EXC_ECALL_S; trap_cause <= {58'b0, 6'(EXC_ECALL_S)}; end
+                            PRIV_MACHINE:    begin exec_trap_cause <= EXC_ECALL_M; trap_cause <= {58'b0, 6'(EXC_ECALL_M)}; end
+                            default:         begin exec_trap_cause <= EXC_ECALL_M; trap_cause <= {58'b0, 6'(EXC_ECALL_M)}; end
                         endcase
                     end
                     else if (issue_instr.is_ebreak) begin
                         exec_trap <= 1'b1;
                         exec_trap_cause <= EXC_BREAKPOINT;
-                        exec_trap_value <= issue_instr.pc;
+                        exec_trap_value <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc};
+                        trap_is_interrupt <= 1'b0;
+                        trap_pc <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc};
+                        trap_cause <= {58'b0, 6'(EXC_BREAKPOINT)};
+                        trap_value <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc};
                     end
                     else if (csr_fault && issue_instr.is_csr) begin
                         exec_trap <= 1'b1;
                         exec_trap_cause <= EXC_ILLEGAL_INSTR;
-                        exec_trap_value <= {{32{1'b0}}, issue_instr.opcode, issue_instr.rd, 
+                        exec_trap_value <= {{32{1'b0}}, issue_instr.opcode, issue_instr.rd,
                                            issue_instr.funct3, issue_instr.rs1, issue_instr.csr_addr};
+                        trap_is_interrupt <= 1'b0;
+                        trap_pc <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc};
+                        trap_cause <= {58'b0, 6'(EXC_ILLEGAL_INSTR)};
+                        trap_value <= {{32{1'b0}}, issue_instr.opcode, issue_instr.rd,
+                                      issue_instr.funct3, issue_instr.rs1, issue_instr.csr_addr};
                     end
+
+                    // MRET/SRET: latch pending flags for redirect in S_WRITEBACK
+                    if (issue_instr.is_mret)
+                        mret_pending <= 1'b1;
+                    if (issue_instr.is_sret)
+                        sret_pending <= 1'b1;
                 end
-                
+
                 S_MDU_WAIT: begin
                     if (mdu_resp_valid)
                         exec_result <= mdu_result;
@@ -777,18 +824,28 @@ module nebula_backend_fpu #(
                         dcache_addr <= {dtlb_ppn, exec_mem_addr[11:0]};
                     else if (dtlb_page_fault) begin
                         exec_trap <= 1'b1;
-                        exec_trap_cause <= issue_instr.is_store || issue_instr.is_fp_store ? 
+                        exec_trap_cause <= issue_instr.is_store || issue_instr.is_fp_store ?
                                           EXC_STORE_PAGE_FAULT : EXC_LOAD_PAGE_FAULT;
                         exec_trap_value <= {{(XLEN-VADDR_WIDTH){exec_mem_addr[VADDR_WIDTH-1]}}, exec_mem_addr};
+                        trap_is_interrupt <= 1'b0;
+                        trap_pc <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc};
+                        trap_cause <= {58'b0, issue_instr.is_store || issue_instr.is_fp_store ?
+                                      6'(EXC_STORE_PAGE_FAULT) : 6'(EXC_LOAD_PAGE_FAULT)};
+                        trap_value <= {{(XLEN-VADDR_WIDTH){exec_mem_addr[VADDR_WIDTH-1]}}, exec_mem_addr};
                     end
                 end
-                
+
                 S_MEM_TLB_WAIT: begin
                     if (ptw_resp_valid && ptw_page_fault) begin
                         exec_trap <= 1'b1;
-                        exec_trap_cause <= issue_instr.is_store || issue_instr.is_fp_store ? 
+                        exec_trap_cause <= issue_instr.is_store || issue_instr.is_fp_store ?
                                           EXC_STORE_PAGE_FAULT : EXC_LOAD_PAGE_FAULT;
                         exec_trap_value <= {{(XLEN-VADDR_WIDTH){exec_mem_addr[VADDR_WIDTH-1]}}, exec_mem_addr};
+                        trap_is_interrupt <= 1'b0;
+                        trap_pc <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc};
+                        trap_cause <= {58'b0, issue_instr.is_store || issue_instr.is_fp_store ?
+                                      6'(EXC_STORE_PAGE_FAULT) : 6'(EXC_LOAD_PAGE_FAULT)};
+                        trap_value <= {{(XLEN-VADDR_WIDTH){exec_mem_addr[VADDR_WIDTH-1]}}, exec_mem_addr};
                     end
                 end
                 
@@ -800,9 +857,14 @@ module nebula_backend_fpu #(
                     if (dcache_resp_valid) begin
                         if (dcache_resp_error) begin
                             exec_trap <= 1'b1;
-                            exec_trap_cause <= issue_instr.is_store || issue_instr.is_fp_store ? 
+                            exec_trap_cause <= issue_instr.is_store || issue_instr.is_fp_store ?
                                               EXC_STORE_ACCESS_FAULT : EXC_LOAD_ACCESS_FAULT;
                             exec_trap_value <= {{(XLEN-VADDR_WIDTH){exec_mem_addr[VADDR_WIDTH-1]}}, exec_mem_addr};
+                            trap_is_interrupt <= 1'b0;
+                            trap_pc <= {{(XLEN-VADDR_WIDTH){issue_instr.pc[VADDR_WIDTH-1]}}, issue_instr.pc};
+                            trap_cause <= {58'b0, issue_instr.is_store || issue_instr.is_fp_store ?
+                                          6'(EXC_STORE_ACCESS_FAULT) : 6'(EXC_LOAD_ACCESS_FAULT)};
+                            trap_value <= {{(XLEN-VADDR_WIDTH){exec_mem_addr[VADDR_WIDTH-1]}}, exec_mem_addr};
                         end
                         else if (issue_instr.is_load) begin
                             mem_result <= sign_extend_load(dcache_resp_data, issue_instr.funct3);
@@ -862,8 +924,10 @@ module nebula_backend_fpu #(
                 end
                 
                 S_TRAP: begin
-                    trap_cause <= exec_trap ? exec_trap_cause : interrupt_cause;
-                    trap_value <= exec_trap ? exec_trap_value : '0;
+                    // trap_cause, trap_value, trap_pc and trap_is_interrupt
+                    // are already set in the cycle BEFORE S_TRAP:
+                    // - For interrupts: set in S_IDLE
+                    // - For exceptions: set in S_EXECUTE / S_MEM_TLB / S_MEM_TLB_WAIT / S_MEM_WAIT
                 end
                 
                 default: ;

@@ -195,6 +195,7 @@ module nebula_core #(
            .software_irq_in(software_irq), .trap_enter, .trap_is_interrupt, .trap_pc, .trap_cause, .trap_value,
            .trap_from_priv(current_priv), .mret_execute(mret_exec), .sret_execute(sret_exec),
            .trap_vector, .return_pc, .return_priv, .interrupt_pending, .interrupt_cause,
+           .current_priv_out(current_priv),
            .csr_satp, .csr_mstatus, .mstatus_mie(), .mstatus_sie(), .mstatus_tvm(), .mstatus_tsr(),
            .mstatus_mprv(), .mstatus_mpp(), .mstatus_spp(), .cycle_count(cycle_counter), .time_count(time_counter),
            .instret_count(instret_counter), .fflags_in(fpu_fflags), .fflags_we(fpu_resp_valid), .frm_out(csr_frm));
@@ -256,7 +257,7 @@ module nebula_core #(
                 .ptw_req(ptw_req_itlb), .ptw_vpn(ptw_vpn_itlb), .ptw_ready, .ptw_resp_valid(ptw_resp_valid && ptw_is_for_itlb),
                 .ptw_page_fault, .ptw_access_fault(ptw_access_fault), .mmu_enabled, .current_priv);
 
-    // Backend (Mantido, mas agora o frontend_packet contém dados corretos)
+    // Backend
     nebula_backend_fpu #(.XLEN(XLEN), .FLEN(FLEN), .VADDR_WIDTH(VADDR_WIDTH), .PADDR_WIDTH(PADDR_WIDTH), .VPN_WIDTH(VPN_WIDTH), .PPN_WIDTH(PPN_WIDTH))
     u_backend (.clk, .rst_n, .frontend_valid, .frontend_in(frontend_packet), .backend_ctrl, .bp_update,
                .dcache_req, .dcache_addr, .dcache_wdata, .dcache_wstrb, .dcache_we, .dcache_is_amo, .dcache_amo_op,
@@ -269,6 +270,8 @@ module nebula_core #(
                .mdu_req, .mdu_rs1, .mdu_rs2, .mdu_funct3, .mdu_is_word, .mdu_ready, .mdu_resp_valid, .mdu_result,
                .fpu_req, .fpu_op, .fpu_rs1, .fpu_rs2, .fpu_rs3, .fpu_int_rs1, .fpu_rm, .fpu_is_single,
                .fpu_ready, .fpu_resp_valid, .fpu_result, .fpu_int_result, .fpu_fflags,
+               .frontend_exception(frontend_exc), .frontend_exception_cause(frontend_exc_cause),
+               .frontend_exception_value(frontend_exc_value),
                .current_priv, .mmu_enabled, .sfence_valid, .sfence_all, .sfence_vpn, .sfence_asid,
                .fence_i_valid, .dcache_flush, .dcache_flush_done, .instr_retired, .instr_retired_2);
 
