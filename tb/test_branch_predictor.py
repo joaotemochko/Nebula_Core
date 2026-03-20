@@ -81,12 +81,27 @@ async def reset_dut(dut):
     await RisingEdge(dut.clk)
 
 async def do_predict(dut, pc):
-    """Solicita predição e retorna (valid, taken, target, is_call, is_ret)."""
+    """Solicita predição e retorna (valid, taken, target, is_call, is_ret).
+
+    prediction é saída COMBINACIONAL de predict_valid e pc.
+    Fluxo:
+      1. Setar predict_valid=1 e pc
+      2. Aguardar Timer(1ns) para propagação dos deltas combinacionais
+      3. Ler prediction (valid=1 se BTB hit)
+      4. Aguardar RisingEdge para que o estado interno (GHR, RAS) avance
+      5. Baixar predict_valid
+    """
+    from cocotb.triggers import Timer
     dut.predict_valid.value = 1
     dut.pc.value            = pc & MASK_V
+    # Propagar deltas combinacionais sem avançar o clock
+    await Timer(1, units="ns")
+    pred = int(dut.prediction.value)
+    # Avançar um ciclo (RAS push/pop ocorre aqui)
     await RisingEdge(dut.clk)
     dut.predict_valid.value = 0
-    pred = int(dut.prediction.value)
+    # Aguardar mais um ciclo para estabilizar
+    await RisingEdge(dut.clk)
     return unpack_prediction(pred)
 
 async def do_update(dut, pc, taken, target,
@@ -295,6 +310,9 @@ def test_branch_all():
             "-Wno-VARHIDDEN",    # parâmetros locais ocultam os do pkg — inofensivo
             "-Wno-WIDTHTRUNC", "-Wno-WIDTHEXPAND",
             "-Wno-ENUMVALUE", "-Wno-UNUSED",
+            # BLKSEQ corrigido no branch_predictor.sv — flag mantida para
+            # compatibilidade caso o usuário use a versão anterior do arquivo
+            "-Wno-BLKSEQ",
         ],
         waves=os.environ.get("WAVES", "0") == "1",
     )

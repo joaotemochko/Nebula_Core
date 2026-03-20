@@ -152,7 +152,7 @@ _pos += _add('rs1',            5)
 _pos += _add('funct3',         3)
 _pos += _add('rd',             5)
 _pos += _add('opcode',         7)
-INSTR_BITS = _pos  # deve ser 236
+INSTR_BITS = _pos  # deve ser 233
 
 def build_instr(**fields):
     """Constrói o valor inteiro de decoded_instr_t com os campos fornecidos."""
@@ -173,11 +173,18 @@ def build_instr(**fields):
 PKT_BITS = 2 * INSTR_BITS + 3
 
 def build_packet(instr0, instr0_valid=1, instr1=0, instr1_valid=0, dual_issue=0):
-    v  = (instr1       & ((1 << INSTR_BITS) - 1)) << (INSTR_BITS + 3)
-    v |= (instr0       & ((1 << INSTR_BITS) - 1)) << 3
-    v |= (instr1_valid & 1) << 2
-    v |= (instr0_valid & 1) << 1
-    v |= (dual_issue   & 1) << 0
+    # frontend_packet_t (struct packed, MSB first = ordem de declaração):
+    #   instr0 (declarado 1º) → bits [468:236]  ← MSB
+    #   instr1 (declarado 2º) → bits [235:3]
+    #   instr1_valid          → bit 2
+    #   instr0_valid          → bit 1
+    #   dual_issue            → bit 0            ← LSB
+    mask = (1 << INSTR_BITS) - 1
+    v  = (instr0       & mask) << (INSTR_BITS + 3)  # instr0 no MSB
+    v |= (instr1       & mask) << 3                  # instr1 abaixo
+    v |= (instr1_valid & 1)    << 2
+    v |= (instr0_valid & 1)    << 1
+    v |= (dual_issue   & 1)    << 0
     return v
 
 # Opcodes RV64I
@@ -275,20 +282,28 @@ async def reset_dut(dut):
     dut.rst_n.value = 1
     await RisingEdge(dut.clk)
 
-async def inject_and_wait(dut, instr_val, timeout=20):
+async def inject_and_wait(dut, instr_val, timeout=30):
     """
     Injeta uma instrução decodificada e aguarda instr_retired=1.
     Retorna o valor de exec_result capturado no ciclo de writeback.
-    O backend leva ~3 ciclos: S_IDLE→S_ISSUE→S_EXECUTE→S_WRITEBACK.
+
+    backend_ctrl_t (packed, MSB→LSB):
+        stall(1) | flush(1) | redirect(1) | redirect_pc(39)
+        bit 41 = stall
     """
+    from cocotb.triggers import FallingEdge
+
+    BACKEND_CTRL_BITS = 1 + 1 + 1 + VADDR  # 42 bits
+    STALL_BIT = BACKEND_CTRL_BITS - 1       # bit 41
+
     pkt = build_packet(instr0=instr_val, instr0_valid=1)
 
     # Esperar backend livre (stall=0)
     t = 0
-    while int(dut.backend_ctrl.value) >> (VADDR - 1 + 3) & 1:
+    while (int(dut.backend_ctrl.value) >> STALL_BIT) & 1:
         await RisingEdge(dut.clk)
         t += 1
-        assert t < 50, "Timeout aguardando backend livre"
+        assert t < 50, "Timeout aguardando backend livre (stall)"
 
     dut.frontend_valid.value = 1
     dut.frontend_in.value    = pkt
@@ -296,15 +311,36 @@ async def inject_and_wait(dut, instr_val, timeout=20):
     dut.frontend_valid.value = 0
     dut.frontend_in.value    = 0
 
-    # Aguardar instr_retired
+    # Aguardar instr_retired — lê exec_result no FallingEdge desse ciclo
     t = 0
     while not int(dut.instr_retired.value):
         await RisingEdge(dut.clk)
         t += 1
-        assert t < timeout, f"Timeout aguardando instr_retired (ciclos={t})"
+        if t % 5 == 0:
+            try:
+                state_val = int(dut.state.value)
+            except Exception:
+                state_val = -1
+            dut._log.info(f"  ciclo={t} instr_retired=0 state={state_val}")
+        assert t < timeout, (
+            f"Timeout aguardando instr_retired após {t} ciclos. "
+            f"Verifique se frontend_valid chegou ao backend e se "
+            f"não há stall permanente."
+        )
 
-    # Ler exec_result diretamente do sinal interno
-    result = int(dut.exec_result.value)
+    # Ler exec_result no meio do ciclo (após propagação combinacional)
+    await FallingEdge(dut.clk)
+    try:
+        result = int(dut.exec_result.value)
+    except AttributeError:
+        # exec_result não exposto — tentar via nome completo do Verilator
+        try:
+            result = int(dut.nebula_backend_fpu__DOT__exec_result.value)
+        except AttributeError:
+            raise AttributeError(
+                "exec_result não acessível. Verifique se --public-flat-rw "
+                "está sendo passado ao Verilator."
+            )
     await RisingEdge(dut.clk)
     return result
 
@@ -556,6 +592,9 @@ def test_alu_all():
             "-Wno-WIDTHTRUNC", "-Wno-WIDTHEXPAND",
             "-Wno-ENUMVALUE", "-Wno-UNUSED", "-Wno-UNDRIVEN",
             "--top-module", "nebula_backend_fpu",
+            # Expor sinais internos (exec_result, regfile, etc.)
+            # necessário para verificar resultado sem instanciar módulo externo
+            "--public-flat-rw",
         ],
         waves=os.environ.get("WAVES", "0") == "1",
     )

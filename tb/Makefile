@@ -106,3 +106,34 @@ help:
 	@echo ""
 
 .PHONY: test_mdu test_alu test_branch test_all clean help _check_rtl
+
+# =============================================================================
+# riscv-tests oficiais
+# =============================================================================
+RISCV_TESTS ?= /opt/riscv-tests/isa
+
+# Compilar Verilator uma vez e rodar todos os testes rv64ui + rv64um
+test_riscv:
+	RTL_DIR=$(RTL_DIR) RISCV_TESTS=$(RISCV_TESTS) \
+	  python3 run_riscv_tests.py
+
+# Só inteiros base (rv64ui) — mais rápido para validação inicial
+test_riscv_ui:
+	RTL_DIR=$(RTL_DIR) RISCV_TESTS=$(RISCV_TESTS) \
+	  python3 run_riscv_tests.py --isa rv64ui
+
+# Só extensão M (mul/div)
+test_riscv_um:
+	RTL_DIR=$(RTL_DIR) RISCV_TESTS=$(RISCV_TESTS) \
+	  python3 run_riscv_tests.py --isa rv64um
+
+# Teste específico — ex: make test_one TEST=add
+test_one:
+	RTL_DIR=$(RTL_DIR) RISCV_TESTS=$(RISCV_TESTS) \
+	  python3 run_riscv_tests.py --test $(TEST)
+
+# Só compilar (verificar erros de síntese)
+compile_riscv:
+	RTL_DIR=$(RTL_DIR) python3 run_riscv_tests.py --compile-only
+
+.PHONY: test_riscv test_riscv_ui test_riscv_um test_one compile_riscv

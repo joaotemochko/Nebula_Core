@@ -9,10 +9,12 @@ import nebula_pkg::*;
  *
  * CORREÇÕES APLICADAS:
  * 1. Todas as declarações "logic" removidas de dentro de always_ff e
- *    always_comb — movidas para sinais de módulo. Isso resolve erros
- *    de síntese em Vivado/Quartus.
+ *    always_comb — movidas para sinais de módulo.
  * 2. found_dirty removido do bloco always_comb da FSM e declarado
- *    como sinal de módulo para evitar comportamento não-determinístico.
+ *    como sinal de módulo.
+ * 3. (novo) *_tmp que eram variáveis locais dentro de always_ff com
+ *    blocking assignment movidos para blocos always_comb separados.
+ *    Isso elimina os warnings BLKSEQ do Verilator 5.036.
  */
 module dcache_l1 #(
     parameter int PADDR_WIDTH = 56,
@@ -113,22 +115,34 @@ module dcache_l1 #(
     logic                        victim_dirty;
     logic [TAG_BITS-1:0]         victim_tag;
 
-    // FIX 1: sinais extraídos de blocos procedurais para nível de módulo
-    logic                        found_dirty;     // para FSM always_comb
+    // Sinais de nível de módulo para combinatorial intermediário
+    logic                        found_dirty;
     logic [LINE_BITS-1:0]        hit_line;
     logic [XLEN-1:0]             selected_word;
 
-    // Sinais temporários para hit/refill/amo (antes dentro de always_ff)
-    logic [XLEN-1:0]             new_word_tmp;
-    logic [LINE_BITS-1:0]        new_line_tmp;
-    logic [XLEN-1:0]             amo_result_tmp;
-    logic [XLEN-1:0]             current_word_tmp;
-    logic [XLEN-1:0]             word_from_buffer_tmp;
+    // =========================================================================
+    // FIX BLKSEQ: cálculos intermediários em always_comb separados
+    // Estes sinais substituem as variáveis locais que estavam em always_ff
+    // =========================================================================
 
-    // Flush scan temporários
-    logic                        flush_found_tmp;
-    logic [INDEX_BITS-1:0]       flush_set_tmp;
-    logic [$clog2(NUM_WAYS)-1:0] flush_way_tmp;
+    // Para S_HIT_PROCESS
+    logic [XLEN-1:0]             hit_new_word;      // apply_wstrb(selected_word, wdata_reg, wstrb_reg)
+    logic [LINE_BITS-1:0]        hit_new_line;      // modify_line(hit_line, hit_new_word, word_offset_reg)
+
+    // Para S_REFILL_DONE
+    logic [XLEN-1:0]             refill_word_from_buf;  // word at word_offset_reg in line_buffer
+    logic [XLEN-1:0]             refill_new_word;        // apply_wstrb(refill_word_from_buf, ...)
+    logic [LINE_BITS-1:0]        refill_new_line;        // final line para escrita
+
+    // Para S_AMO_PROCESS
+    logic [XLEN-1:0]             amo_current_word;   // palavra atual (hit ou refill)
+    logic [XLEN-1:0]             amo_result;         // resultado da operação AMO
+    logic [LINE_BITS-1:0]        amo_new_line;       // linha com resultado AMO
+
+    // Para S_FLUSH_SCAN
+    logic                        flush_found;
+    logic [INDEX_BITS-1:0]       flush_set_next;
+    logic [$clog2(NUM_WAYS)-1:0] flush_way_next;
 
     // =========================================================================
     // Tag Comparison (combinacional)
@@ -174,6 +188,73 @@ module dcache_l1 #(
             3'd7: selected_word = hit_line[511:448];
             default: selected_word = '0;
         endcase
+    end
+
+    // =========================================================================
+    // FIX: S_HIT_PROCESS — cálculo combinacional
+    // =========================================================================
+    always_comb begin
+        hit_new_word = apply_wstrb(selected_word, wdata_reg, wstrb_reg);
+        hit_new_line = modify_line(hit_line, hit_new_word, word_offset_reg);
+    end
+
+    // =========================================================================
+    // FIX: S_REFILL_DONE — cálculo combinacional
+    // =========================================================================
+    always_comb begin
+        case (word_offset_reg)
+            3'd0: refill_word_from_buf = line_buffer[63:0];
+            3'd1: refill_word_from_buf = line_buffer[127:64];
+            3'd2: refill_word_from_buf = line_buffer[191:128];
+            3'd3: refill_word_from_buf = line_buffer[255:192];
+            3'd4: refill_word_from_buf = line_buffer[319:256];
+            3'd5: refill_word_from_buf = line_buffer[383:320];
+            3'd6: refill_word_from_buf = line_buffer[447:384];
+            3'd7: refill_word_from_buf = line_buffer[511:448];
+            default: refill_word_from_buf = '0;
+        endcase
+
+        refill_new_word = apply_wstrb(refill_word_from_buf, wdata_reg, wstrb_reg);
+
+        if (we_reg && !is_amo_reg)
+            refill_new_line = modify_line(line_buffer, refill_new_word, word_offset_reg);
+        else
+            refill_new_line = line_buffer;
+    end
+
+    // =========================================================================
+    // FIX: S_AMO_PROCESS — cálculo combinacional
+    // =========================================================================
+    always_comb begin
+        // Selecionar palavra atual — após refill é sempre selected_word
+        // (hit_way_idx_reg aponta para a via correta após S_REFILL_DONE)
+        amo_current_word = selected_word;
+
+        amo_result   = compute_amo(amo_op_reg, amo_current_word, wdata_reg,
+                                   (wstrb_reg == 8'h0F));
+        amo_new_line = modify_line(data_array[index_reg][hit_way_idx_reg],
+                                   amo_result, word_offset_reg);
+    end
+
+    // =========================================================================
+    // FIX: S_FLUSH_SCAN — cálculo combinacional
+    // =========================================================================
+    always_comb begin
+        flush_found    = 1'b0;
+        flush_set_next = flush_set_idx;
+        flush_way_next = flush_way_idx;
+
+        for (int s = 0; s < NUM_SETS; s++) begin
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                if (!flush_found &&
+                    tag_array[s][w].valid &&
+                    tag_array[s][w].dirty) begin
+                    flush_set_next = s[INDEX_BITS-1:0];
+                    flush_way_next = w[$clog2(NUM_WAYS)-1:0];
+                    flush_found    = 1'b1;
+                end
+            end
+        end
     end
 
     // =========================================================================
@@ -284,7 +365,6 @@ module dcache_l1 #(
 
     // =========================================================================
     // FSM - Próximo Estado
-    // FIX 2: found_dirty agora é sinal de módulo, não variável local
     // =========================================================================
     always_comb begin
         found_dirty = 1'b0;
@@ -317,13 +397,13 @@ module dcache_l1 #(
 
             S_WRITEBACK_REQ:  next_state = S_WRITEBACK_WAIT;
             S_WRITEBACK_WAIT: begin
-                if (mem_ack)   next_state = S_REFILL_REQ;
+                if (mem_ack)        next_state = S_REFILL_REQ;
                 else if (mem_error) next_state = S_ERROR;
             end
 
             S_REFILL_REQ:  next_state = S_REFILL_WAIT;
             S_REFILL_WAIT: begin
-                if (mem_ack)   next_state = S_REFILL_DONE;
+                if (mem_ack)        next_state = S_REFILL_DONE;
                 else if (mem_error) next_state = S_ERROR;
             end
 
@@ -432,8 +512,7 @@ module dcache_l1 #(
 
     // =========================================================================
     // Lógica Sequencial
-    // FIX 3: todos os blocos com variáveis locais reescritos usando
-    //        sinais de módulo declarados acima.
+    // Todos os *_tmp são calculados em always_comb acima; aqui só usamos <=
     // =========================================================================
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -499,38 +578,18 @@ module dcache_l1 #(
                             victim_way <= get_plru_victim(plru_bits[index_reg]);
                     end
 
-                    // FIX 4: sem variáveis locais — usar sinais de módulo
+                    // FIX: sem blocking = — usa sinais comb calculados acima
                     S_HIT_PROCESS: begin
                         if (we_reg) begin
-                            new_word_tmp = apply_wstrb(selected_word, wdata_reg, wstrb_reg);
-                            data_array[index_reg][hit_way_idx_reg] <=
-                                modify_line(hit_line, new_word_tmp, word_offset_reg);
+                            data_array[index_reg][hit_way_idx_reg] <= hit_new_line;
                             tag_array[index_reg][hit_way_idx_reg].dirty <= 1'b1;
                         end
                         plru_bits[index_reg] <= update_plru(plru_bits[index_reg], hit_way_idx_reg);
                     end
 
-                    // FIX 5: AMO sem variáveis locais
+                    // FIX: AMO usa sinais comb
                     S_AMO_PROCESS: begin
-                        // Selecionar palavra atual (hit ou refill)
-                        case (word_offset_reg)
-                            3'd0: current_word_tmp = line_buffer[63:0];
-                            3'd1: current_word_tmp = line_buffer[127:64];
-                            3'd2: current_word_tmp = line_buffer[191:128];
-                            3'd3: current_word_tmp = line_buffer[255:192];
-                            3'd4: current_word_tmp = line_buffer[319:256];
-                            3'd5: current_word_tmp = line_buffer[383:320];
-                            3'd6: current_word_tmp = line_buffer[447:384];
-                            3'd7: current_word_tmp = line_buffer[511:448];
-                            default: current_word_tmp = selected_word;
-                        endcase
-
-                        amo_result_tmp = compute_amo(amo_op_reg, current_word_tmp, wdata_reg,
-                                                     (wstrb_reg == 8'h0F));
-
-                        data_array[index_reg][hit_way_idx_reg] <=
-                            modify_line(data_array[index_reg][hit_way_idx_reg],
-                                        amo_result_tmp, word_offset_reg);
+                        data_array[index_reg][hit_way_idx_reg] <= amo_new_line;
                         tag_array[index_reg][hit_way_idx_reg].dirty <= 1'b1;
                         plru_bits[index_reg] <= update_plru(plru_bits[index_reg], hit_way_idx_reg);
                     end
@@ -540,28 +599,9 @@ module dcache_l1 #(
                             line_buffer <= mem_rdata;
                     end
 
-                    // FIX 6: REFILL_DONE sem variáveis locais
+                    // FIX: REFILL_DONE usa sinais comb
                     S_REFILL_DONE: begin
-                        new_line_tmp = line_buffer;
-
-                        if (we_reg && !is_amo_reg) begin
-                            case (word_offset_reg)
-                                3'd0: word_from_buffer_tmp = line_buffer[63:0];
-                                3'd1: word_from_buffer_tmp = line_buffer[127:64];
-                                3'd2: word_from_buffer_tmp = line_buffer[191:128];
-                                3'd3: word_from_buffer_tmp = line_buffer[255:192];
-                                3'd4: word_from_buffer_tmp = line_buffer[319:256];
-                                3'd5: word_from_buffer_tmp = line_buffer[383:320];
-                                3'd6: word_from_buffer_tmp = line_buffer[447:384];
-                                3'd7: word_from_buffer_tmp = line_buffer[511:448];
-                                default: word_from_buffer_tmp = '0;
-                            endcase
-
-                            new_word_tmp = apply_wstrb(word_from_buffer_tmp, wdata_reg, wstrb_reg);
-                            new_line_tmp = modify_line(line_buffer, new_word_tmp, word_offset_reg);
-                        end
-
-                        data_array[index_reg][victim_way]       <= new_line_tmp;
+                        data_array[index_reg][victim_way]       <= refill_new_line;
                         tag_array[index_reg][victim_way].valid  <= 1'b1;
                         tag_array[index_reg][victim_way].dirty  <= we_reg;
                         tag_array[index_reg][victim_way].tag    <= tag_reg;
@@ -569,27 +609,11 @@ module dcache_l1 #(
                         plru_bits[index_reg] <= update_plru(plru_bits[index_reg], victim_way);
                     end
 
-                    // FIX 7: FLUSH_SCAN sem variáveis locais
+                    // FIX: FLUSH_SCAN usa sinais comb
                     S_FLUSH_SCAN: begin
-                        flush_found_tmp = 1'b0;
-                        flush_set_tmp   = flush_set_idx;
-                        flush_way_tmp   = flush_way_idx;
-
-                        for (int s = 0; s < NUM_SETS; s++) begin
-                            for (int w = 0; w < NUM_WAYS; w++) begin
-                                if (!flush_found_tmp &&
-                                    tag_array[s][w].valid &&
-                                    tag_array[s][w].dirty) begin
-                                    flush_set_tmp   = s[INDEX_BITS-1:0];
-                                    flush_way_tmp   = w[$clog2(NUM_WAYS)-1:0];
-                                    flush_found_tmp = 1'b1;
-                                end
-                            end
-                        end
-
-                        if (flush_found_tmp) begin
-                            flush_set_idx <= flush_set_tmp;
-                            flush_way_idx <= flush_way_tmp;
+                        if (flush_found) begin
+                            flush_set_idx <= flush_set_next;
+                            flush_way_idx <= flush_way_next;
                         end else begin
                             flush_set_idx <= '0;
                             flush_way_idx <= '0;

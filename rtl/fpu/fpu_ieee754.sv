@@ -586,6 +586,9 @@ module fpu_ieee754 #(
         logic lt;
         logic le;
         
+        lt = 1'b0;
+        le = 1'b0;
+
         simple_fp_result = '0;
         simple_int_result = '0;
         simple_flags = '0;
