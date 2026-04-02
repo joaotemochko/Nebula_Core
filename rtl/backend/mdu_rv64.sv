@@ -95,8 +95,10 @@ module mdu_rv64 #(
 
     // temp_remainder: próximo remainder durante iteração de divisão
     always_comb begin
-        temp_remainder = {remainder_reg[XLEN-2:0],
-                          dividend_reg[XLEN-1-div_counter]};
+        logic [5:0] bit_idx;
+        bit_idx = (is_word_reg ? 6'd31 : 6'd63) - div_counter[5:0];
+        
+        temp_remainder = {remainder_reg[XLEN-2:0], dividend_reg[bit_idx]};
     end
 
     // div_q_final / div_r_final: quociente e resto com sinal aplicado
@@ -270,8 +272,13 @@ module mdu_rv64 #(
                     if (div_by_zero) begin
                         case (funct3_reg)
                             F3_DIV, F3_DIVU: result <= '1;
-                            F3_REM, F3_REMU: result <= op1_reg;
-                            default:         result <= '0;
+                            F3_REM, F3_REMU: begin
+                                if (is_word_reg)
+                                    result <= {{32{op1_reg[31]}}, op1_reg[31:0]};
+                                else
+                                    result <= op1_reg;
+                            end
+                            default: result <= '0;
                         endcase
                     end else if (div_overflow) begin
                         case (funct3_reg)

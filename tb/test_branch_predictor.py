@@ -149,8 +149,8 @@ async def test_btb_miss_then_hit(dut):
 @cocotb.test()
 async def test_bht_saturating_counter(dut):
     """
-    Treinar 4x taken → contador satura em 11 → prevê taken.
-    Treinar 4x not-taken → contador satura em 00 → prevê not-taken.
+    Simula o comportamento em pipeline: Lê a predição (o que em núcleos
+    avançados pode gerar snapshot de GHR) e depois atualiza.
     """
     cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
     await reset_dut(dut)
@@ -158,7 +158,12 @@ async def test_bht_saturating_counter(dut):
     pc  = 0x100_0100
     tgt = 0x100_0120
 
+    # Fase de aquecimento (Taken)
     for _ in range(4):
+        # O GHR deve se alinhar com um padrão de loop real.
+        # Ao chamar do_predict antes do update, capturamos o GHR
+        # estável daquele momento da instrução.
+        await do_predict(dut, pc)
         await do_update(dut, pc, taken=True, target=tgt)
 
     valid, taken, *_ = await do_predict(dut, pc)
@@ -166,7 +171,9 @@ async def test_bht_saturating_counter(dut):
         f"[FAIL] Deveria prever taken após 4x taken, valid={valid} taken={taken}"
     dut._log.info("[PASS] BHT satura em taken")
 
+    # Fase de reversão (Not-Taken)
     for _ in range(4):
+        await do_predict(dut, pc)
         await do_update(dut, pc, taken=False, target=tgt, mispredicted=True)
 
     valid, taken, *_ = await do_predict(dut, pc)

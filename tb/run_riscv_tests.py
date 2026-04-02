@@ -161,7 +161,7 @@ def compile_verilator() -> bool:
 # Rodar um teste
 # =============================================================================
 
-def run_test(elf_path: Path) -> dict:
+def run_test(elf_path: Path, debug: bool = False, max_cycles: int = None) -> dict:
     """Roda um único teste riscv-test. Retorna dict com resultado."""
     name    = elf_path.stem
     hex_dir = BUILD_DIR / "hex"
@@ -175,12 +175,19 @@ def run_test(elf_path: Path) -> dict:
     # Executar simulação
     sim_bin = BUILD_DIR / "nebula_tb_sim"
     cmd = [str(sim_bin), f"+HEXFILE={hex_path}"]
+    if debug:
+        cmd.append("+DEBUG")
+    if max_cycles:
+        cmd.append(f"+CYCLES={max_cycles}")
 
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=60   # 60s máximo por teste
+            cmd, capture_output=False if debug else True,
+            text=True,
+            timeout=120
         )
+        if debug:
+            return {"name": name, "status": "DEBUG", "cycles": -1}
         output = result.stdout + result.stderr
 
         if "[PASS]" in output:
@@ -210,6 +217,8 @@ def main():
     parser.add_argument("--test",   default=None, help="Teste específico (ex: add)")
     parser.add_argument("--jobs",   type=int, default=4, help="Testes em paralelo")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--debug",  action="store_true", help="Mostrar estado a cada ciclo (+DEBUG)")
+    parser.add_argument("--cycles", type=int, default=None, help="Máximo de ciclos (override TIMEOUT_CYC)")
     args = parser.parse_args()
 
     # Compilar Verilator
@@ -244,10 +253,11 @@ def main():
     elfs.sort()
     print(f"\n{BOLD}=== Rodando {len(elfs)} testes ==={RESET}\n")
 
-    # Executar em paralelo
+    # Executar em paralelo (serial se debug)
     results = []
-    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futures = {ex.submit(run_test, e): e for e in elfs}
+    jobs = 1 if args.debug else args.jobs
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        futures = {ex.submit(run_test, e, args.debug, args.cycles): e for e in elfs}
         for fut in as_completed(futures):
             r = fut.result()
             results.append(r)

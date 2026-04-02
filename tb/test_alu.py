@@ -293,7 +293,8 @@ async def inject_and_wait(dut, instr_val, timeout=30):
     """
     from cocotb.triggers import FallingEdge
 
-    BACKEND_CTRL_BITS = 1 + 1 + 1 + VADDR  # 42 bits
+    BP_UPDATE_BITS = 83
+    BACKEND_CTRL_BITS = 1 + 1 + 1 + VADDR + BP_UPDATE_BITS  # 42 bits
     STALL_BIT = BACKEND_CTRL_BITS - 1       # bit 41
 
     pkt = build_packet(instr0=instr_val, instr0_valid=1)

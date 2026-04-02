@@ -137,3 +137,7 @@ compile_riscv:
 	RTL_DIR=$(RTL_DIR) python3 run_riscv_tests.py --compile-only
 
 .PHONY: test_riscv test_riscv_ui test_riscv_um test_one compile_riscv
+
+# Teste de Dual Issue e comportamento
+test_dual_issue:
+	RTL_DIR=$(RTL_DIR) WAVES=1 pytest test_nebula_dual_issue.py -s

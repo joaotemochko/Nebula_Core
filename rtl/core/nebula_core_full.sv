@@ -15,7 +15,7 @@ import nebula_pkg::*;
  * 3. ptw_mem_addr exposto como sinal de 64 bits para acomodar os
  *    64 bits de write data.
  */
-module nebula_core #(
+module nebula_core_full #(
     parameter int HART_ID      = 0,
     parameter int XLEN         = 64,
     parameter int FLEN         = 64,
