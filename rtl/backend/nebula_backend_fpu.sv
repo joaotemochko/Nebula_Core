@@ -499,7 +499,8 @@ module nebula_backend_fpu #(
                     next_state = S_EXECUTE;
             end
             S_EXECUTE: begin
-                if (exec_trap) next_state = S_TRAP;
+                if (issue_instr0.is_ecall || issue_instr0.is_ebreak || (issue_instr0.is_csr && csr_fault)) 
+                    next_state = S_TRAP;
                 else if (issue_instr0.is_load || issue_instr0.is_store ||
                          issue_instr0.is_fp_load || issue_instr0.is_fp_store ||
                          issue_instr0.is_amo ||
@@ -507,7 +508,7 @@ module nebula_backend_fpu #(
                     next_state = mmu_enabled ? S_MEM_TLB : S_MEM_ACCESS;
                 else if (issue_instr0.is_sfence_vma) next_state = S_SFENCE;
                 else if (issue_instr0.is_fence_i)    next_state = S_FENCE_I;
-                else                                  next_state = S_WRITEBACK;
+                else                                 next_state = S_WRITEBACK;
             end
             S_MDU_WAIT:     if (mdu_resp_valid)  next_state = S_WRITEBACK;
             S_FPU_WAIT:     if (fpu_resp_valid)  next_state = S_WRITEBACK;
@@ -631,8 +632,8 @@ module nebula_backend_fpu #(
     assign csr_op    = issue_instr0.funct3;
 
     assign trap_enter = (state == S_TRAP);
-    assign mret_exec  = (state == S_EXECUTE) && issue_instr0.is_mret;
-    assign sret_exec  = (state == S_EXECUTE) && issue_instr0.is_sret;
+    assign mret_exec  = (state == S_WRITEBACK) && mret_pending;
+    assign sret_exec  = (state == S_WRITEBACK) && sret_pending;
 
     assign sfence_valid = (state == S_SFENCE);
     assign sfence_all   = (issue_instr0.rs1 == 5'd0) && (issue_instr0.rs2 == 5'd0);
@@ -880,16 +881,18 @@ module nebula_backend_fpu #(
                             regfile[issue_instr0.rd] <= mem0_result;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
-                        // Regra de Ouro: Não gravar Stores nem Branches!
-                        end else if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && !issue_instr0.is_branch) begin
+                        // CORREÇÃO: Bloquear a FPU de escrever "lixo" no x1 e x2!
+                        // Só escreve se não for FPU, OU se for uma conversão específica de Float->Int
+                        end else if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && !issue_instr0.is_branch &&
+                                     (!issue_instr0.is_fp || (decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE, FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU, FPU_CLASS, FPU_MV_X_W}))) begin
                             regfile[issue_instr0.rd] <= exec_result0;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
                         end
                         
-                        // 2. Gravar a Instr 1 (ALU, etc) <- FOI ISTO QUE EU TINHA APAGADO!
+                        // 2. Gravar a Instr 1 (ALU, etc)
                         if (issue_valid1) begin
-                            if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && !issue_instr1.is_branch) begin
+                            if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && !issue_instr1.is_branch && !issue_instr1.is_fp) begin
                                 regfile[issue_instr1.rd] <= exec_result1;
                                 mem1_rd     <= issue_instr1.rd;
                                 mem1_int_we <= 1'b1;
@@ -898,7 +901,8 @@ module nebula_backend_fpu #(
                     end else begin
                         
                         // 1. Gravar a Instr 0 (ALU, etc)
-                        if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && !issue_instr0.is_branch) begin
+                        if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && !issue_instr0.is_branch &&
+                            (!issue_instr0.is_fp || (decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE, FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU, FPU_CLASS, FPU_MV_X_W}))) begin
                             regfile[issue_instr0.rd] <= exec_result0;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
@@ -909,14 +913,14 @@ module nebula_backend_fpu #(
                             regfile[issue_instr1.rd] <= mem1_result;
                             mem1_rd     <= issue_instr1.rd;
                             mem1_int_we <= 1'b1;
-                        end else if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && !issue_instr1.is_branch) begin
+                        end else if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && !issue_instr1.is_branch && !issue_instr1.is_fp) begin
                             regfile[issue_instr1.rd] <= exec_result1;
                             mem1_rd     <= issue_instr1.rd;
                             mem1_int_we <= 1'b1;
                         end
                     end
 
-                    // FP writeback (mantém-se inalterado)
+                    // FP writeback
                     if (issue_instr0.is_fp_load) begin
                         fpregfile[issue_instr0.rd] <= mem_fp_result;
                         mem0_rd    <= issue_instr0.rd;

@@ -639,6 +639,24 @@ module fpu_ieee754 #(
                 else simple_fp_result = (a.sign ? (rs1_r < rs2_r) : (rs1_r > rs2_r)) ? rs1_r : rs2_r;
             end
             
+            FPU_CVT_W: begin
+                logic [11:0] cvt_shift;
+                logic [EXT_MANT_BITS-1:0] cvt_mant;
+                if (a.nan || a.inf) begin
+                    simple_int_result = a.sign ? 64'hFFFFFFFF80000000 : 64'h000000007FFFFFFF;
+                end else if (a.exp < 0) begin
+                    simple_int_result = '0;
+                end else begin
+                    // O bit implícito do IEEE-754 está no index 55. Deslocamos com base no expoente.
+                    cvt_shift = 12'd55 - a.exp[11:0];
+                    cvt_mant = (cvt_shift < 64) ? (a.mant >> cvt_shift) : '0;
+                    simple_int_result = {{32{1'b0}}, cvt_mant[31:0]};
+                    if (a.sign) simple_int_result = -simple_int_result;
+                    // Sign-extend de 32 para 64 bits (Padrão RV64)
+                    simple_int_result = {{32{simple_int_result[31]}}, simple_int_result[31:0]};
+                end
+            end
+
             FPU_MV_X_W: begin
                 if (is_single_r)
                     simple_int_result = {{32{rs1_r[31]}}, rs1_r[31:0]};
@@ -741,14 +759,14 @@ module fpu_ieee754 #(
             int_result = '0;
             fflags = simple_flags;
         end
-        else if (op_r inside {FPU_MV_X_W, FPU_CLASS, FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE}) begin
+        else if (op_r inside {FPU_MV_X_W, FPU_CLASS, FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE, FPU_CVT_W}) begin
             result = '0;
             int_result = simple_int_result;
             fflags = simple_flags;
         end
         else begin
             result = is_single_r ? {32'hFFFF_FFFF, pack_sp(res, flags)} : pack_dp(res, flags);
-            int_result = '0;  // TODO: conversion results
+            int_result = '0;
             fflags = flags;
         end
     end
@@ -967,6 +985,46 @@ module fpu_ieee754 #(
                     res.mant <= div_quotient[EXT_MANT_BITS-1:0];
                 end
                 
+                S_CVT_EXECUTE: begin
+                    if (op_r == FPU_CVT_INT) begin
+                        logic sign;
+                        logic [63:0] abs_val;
+                        logic [5:0] lz;
+                        
+                        // rs2_r: 0=W, 1=WU, 2=L, 3=LU
+                        if (rs2_r[1]) begin // L ou LU (64-bit)
+                            sign = ~rs2_r[0] & int_rs1_r[63];
+                            abs_val = sign ? -int_rs1_r : int_rs1_r;
+                        end else begin // W ou WU (32-bit)
+                            sign = ~rs2_r[0] & int_rs1_r[31];
+                            abs_val = sign ? -{{32{int_rs1_r[31]}}, int_rs1_r[31:0]} : {32'b0, int_rs1_r[31:0]};
+                        end
+                        
+                        if (abs_val == 0) begin
+                            res.zero <= 1'b1;
+                            res.mant <= '0;
+                            res.exp  <= '0;
+                            res.sign <= 1'b0;
+                        end else begin
+                            lz = 0;
+                            for (int i = 63; i >= 0; i--) begin
+                                if (abs_val[i]) begin
+                                    lz = 63 - i;
+                                    break;
+                                end
+                            end
+                            res.zero <= 1'b0;
+                            res.sign <= sign;
+                            // Normalizar para alinhar o bit mais significativo no índice 55
+                            if ((63 - lz) >= 55)
+                                res.mant <= abs_val >> ((63 - lz) - 55);
+                            else
+                                res.mant <= abs_val << (55 - (63 - lz));
+                            res.exp <= (63 - lz);
+                        end
+                    end
+                end
+
                 S_ROUND: begin
                     logic inexact;
                     logic [EXT_MANT_BITS-1:0] rounded;
