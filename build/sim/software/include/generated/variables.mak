@@ -1,0 +1,29 @@
+PACKAGES=libc libcompiler_rt libbase libfatfs liblitespi liblitedram libliteeth liblitesdcard liblitesata bios
+PACKAGE_DIRS=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libc /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libcompiler_rt /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libbase /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libfatfs /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/liblitespi /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/liblitedram /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libliteeth /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/liblitesdcard /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/liblitesata /home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/bios
+LIBS=libc libcompiler_rt libbase libfatfs liblitespi liblitedram libliteeth liblitesdcard liblitesata
+TRIPLE=riscv64-unknown-elf
+CPU=nebula
+CPUFAMILY=riscv
+CPUFLAGS=-march=rv64imafdc -mabi=lp64d -D__nebula__
+CPUENDIANNESS=little
+CLANG=0
+CPU_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core
+SOC_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc
+PICOLIBC_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/pythondata-software-picolibc/pythondata_software_picolibc/data
+PICOLIBC_FORMAT=integer
+LIBC_MODE=minimal
+COMPILER_RT_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/pythondata-software-compiler_rt/pythondata_software_compiler_rt/data
+export BUILDINC_DIRECTORY
+BUILDINC_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/build/sim/software/include
+LIBC_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libc
+LIBCOMPILER_RT_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libcompiler_rt
+LIBBASE_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libbase
+LIBFATFS_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libfatfs
+LIBLITESPI_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/liblitespi
+LIBLITEDRAM_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/liblitedram
+LIBLITEETH_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/libliteeth
+LIBLITESDCARD_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/liblitesdcard
+LIBLITESATA_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/liblitesata
+BIOS_DIRECTORY=/home/ubuntu/Documentos/GitHub/Nebula_Core/LiteX/litex/litex/soc/software/bios
+LTO=0
+BIOS_CONSOLE_FULL=1

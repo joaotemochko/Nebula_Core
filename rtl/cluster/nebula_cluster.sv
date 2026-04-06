@@ -91,7 +91,7 @@ module nebula_cluster #(
 
             localparam int HART_ID = CLUSTER_ID * NUM_CORES + c;
 
-            nebula_core #(
+            nebula_core_full #(
                 .HART_ID(HART_ID), .XLEN(XLEN),
                 .PADDR_WIDTH(PADDR_WIDTH), .VADDR_WIDTH(VADDR_WIDTH),
                 .L1I_SIZE_KB(L1I_SIZE_KB), .L1D_SIZE_KB(L1D_SIZE_KB),

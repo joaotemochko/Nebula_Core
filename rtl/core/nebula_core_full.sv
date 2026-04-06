@@ -165,7 +165,11 @@ module nebula_core_full #(
     // =========================================================================
     // Control
     // =========================================================================
-    assign mmu_enabled   = (csr_satp[63:60] != 4'b0000) && (current_priv != PRIV_MACHINE);
+    logic immu_enabled, dmmu_enabled;
+    
+    assign immu_enabled = (csr_satp[63:60] != 4'b0000) && (current_priv != PRIV_MACHINE);
+    assign dmmu_enabled = (csr_satp[63:60] != 4'b0000) && 
+                          ((current_priv != PRIV_MACHINE) || (csr_mstatus[17] && csr_mstatus[12:11] != PRIV_MACHINE));
     assign fpu_rm_final  = (fpu_rm == RM_DYN) ? csr_frm : fpu_rm;
     assign ptw_is_for_itlb = ptw_req_itlb && !ptw_req_dtlb;
     assign ptw_vpn       = ptw_req_dtlb ? ptw_vpn_dtlb : ptw_vpn_itlb;
@@ -389,7 +393,7 @@ module nebula_core_full #(
         .ptw_req(ptw_req_itlb), .ptw_vpn(ptw_vpn_itlb),
         .ptw_ready, .ptw_resp_valid(ptw_resp_valid && ptw_is_for_itlb),
         .ptw_page_fault, .ptw_access_fault(ptw_access_fault),
-        .mmu_enabled, .current_priv
+        .mmu_enabled(immu_enabled), .current_priv
     );
 
     // =========================================================================
@@ -422,7 +426,7 @@ module nebula_core_full #(
         .frontend_exception(frontend_exc),
         .frontend_exception_cause(frontend_exc_cause),  // logic [5:0]
         .frontend_exception_value(frontend_exc_value),
-        .current_priv, .mmu_enabled,
+        .current_priv, .mmu_enabled(dmmu_enabled),
         .sfence_valid, .sfence_all, .sfence_vpn, .sfence_asid,
         .fence_i_valid, .dcache_flush, .dcache_flush_done,
         .instr_retired, .instr_retired_2
