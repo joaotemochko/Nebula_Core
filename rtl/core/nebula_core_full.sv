@@ -39,6 +39,8 @@ module nebula_core_full #(
     output logic                      dmem_we,
     output logic [PADDR_WIDTH-1:0]    dmem_addr,
     output logic [L1_LINE_SIZE*8-1:0] dmem_wdata,
+    output logic [L1_LINE_SIZE-1:0]   dmem_wstrb,
+    output logic                      dmem_uncached,
     input  wire                       dmem_ack,
     input  wire [L1_LINE_SIZE*8-1:0]  dmem_rdata,
     input  wire                       dmem_error,
@@ -76,7 +78,7 @@ module nebula_core_full #(
     frontend_packet_t frontend_packet;
     logic             frontend_valid;
 
-    // FIX 1: tipo alinhado com nebula_frontend_rvc (logic [5:0])
+    // Tipo alinhado com nebula_frontend_rvc (logic [5:0])
     logic        frontend_exc;
     logic [5:0]  frontend_exc_cause;
     logic [XLEN-1:0] frontend_exc_value;
@@ -97,8 +99,8 @@ module nebula_core_full #(
     logic                    dcache_ready, dcache_resp_valid, dcache_resp_error;
     logic [PADDR_WIDTH-1:0]  dcache_addr;
     logic [XLEN-1:0]         dcache_wdata, dcache_resp_data;
-    logic [7:0]              dcache_wstrb;
     logic [4:0]              dcache_amo_op;
+    logic [7:0]              dcache_wstrb;
 
     // TLB
     logic                    itlb_req, itlb_hit, itlb_page_fault;
@@ -230,7 +232,8 @@ module nebula_core_full #(
         .mem_req(dmem_req), .mem_we(dmem_we),
         .mem_addr(dmem_addr), .mem_wdata(dmem_wdata),
         .mem_ack(dmem_ack), .mem_rdata(dmem_rdata),
-        .mem_error(dmem_error)
+        .mem_error(dmem_error), .mem_wstrb(dmem_wstrb),
+        .mem_uncached (dmem_uncached)
     );
 
     // =========================================================================
@@ -406,7 +409,7 @@ module nebula_core_full #(
         .clk, .rst_n,
         .frontend_valid, .frontend_in(frontend_packet),
         .backend_ctrl, .bp_update,
-        .dcache_req, .dcache_addr, .dcache_wdata, .dcache_wstrb,
+        .dcache_req, .dcache_addr, .dcache_wdata, .dcache_wstrb(dcache_wstrb),
         .dcache_we, .dcache_is_amo, .dcache_amo_op,
         .dcache_ready, .dcache_resp_valid, .dcache_resp_data, .dcache_resp_error,
         .dtlb_req, .dtlb_vpn, .dtlb_is_store,
@@ -424,7 +427,7 @@ module nebula_core_full #(
         .fpu_rm, .fpu_is_single,
         .fpu_ready, .fpu_resp_valid, .fpu_result, .fpu_int_result, .fpu_fflags,
         .frontend_exception(frontend_exc),
-        .frontend_exception_cause(frontend_exc_cause),  // logic [5:0]
+        .frontend_exception_cause(frontend_exc_cause),
         .frontend_exception_value(frontend_exc_value),
         .current_priv, .mmu_enabled(dmmu_enabled),
         .sfence_valid, .sfence_all, .sfence_vpn, .sfence_asid,

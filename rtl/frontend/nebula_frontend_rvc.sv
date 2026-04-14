@@ -77,42 +77,46 @@ module nebula_frontend_rvc #(
         hw0 = '0; hw1 = '0; hw2 = '0; hw3 = '0;
         val0 = 0; val1 = 0; val2 = 0; val3 = 0;
 
-        case (fetch_offset[1:0])
-            2'b00: begin
-                hw0 = fetch_buffer[15:0];  val0 = fetch_buffer_valid[0];
-                hw1 = fetch_buffer[31:16]; val1 = fetch_buffer_valid[1];
-                hw2 = fetch_buffer[47:32]; val2 = fetch_buffer_valid[2];
-                hw3 = fetch_buffer[63:48]; val3 = fetch_buffer_valid[3];
-            end
-            2'b01: begin
-                hw0 = fetch_buffer[31:16]; val0 = fetch_buffer_valid[1];
-                hw1 = fetch_buffer[47:32]; val1 = fetch_buffer_valid[2];
-                hw2 = fetch_buffer[63:48]; val2 = fetch_buffer_valid[3];
-                // FIX 2: usar fetch_buffer_valid[4] não fetch_offset[2]
-                hw3 = fetch_buffer[79:64]; val3 = fetch_buffer_valid[4];
-            end
-            2'b10: begin
-                hw0 = fetch_buffer[47:32]; val0 = fetch_buffer_valid[2];
-                hw1 = fetch_buffer[63:48]; val1 = fetch_buffer_valid[3];
-                hw2 = fetch_buffer[79:64]; val2 = fetch_buffer_valid[4];
-                hw3 = 16'h0;               val3 = 1'b0;
-            end
-            2'b11: begin
-                hw0 = fetch_buffer[63:48]; val0 = fetch_buffer_valid[3];
-                // FIX 2: halfword extra usa bit[4]
-                hw1 = fetch_buffer[79:64]; val1 = fetch_buffer_valid[4];
-                hw2 = 16'h0;               val2 = 1'b0;
-                hw3 = 16'h0;               val3 = 1'b0;
-            end
-        endcase
+        if (fetch_offset[2]) begin
+            hw0 = fetch_buffer[79:64]; val0 = fetch_buffer_valid[4];
+            hw1 = fetch_buffer[15:0];  val1 = fetch_buffer_valid[0];
+            hw2 = fetch_buffer[31:16]; val2 = fetch_buffer_valid[1];
+            hw3 = fetch_buffer[47:32]; val3 = fetch_buffer_valid[2];
+        end else begin
+            case (fetch_offset[1:0])
+                2'b00: begin
+                    hw0 = fetch_buffer[15:0];  val0 = fetch_buffer_valid[0];
+                    hw1 = fetch_buffer[31:16]; val1 = fetch_buffer_valid[1];
+                    hw2 = fetch_buffer[47:32]; val2 = fetch_buffer_valid[2];
+                    hw3 = fetch_buffer[63:48]; val3 = fetch_buffer_valid[3];
+                end
+                2'b01: begin
+                    hw0 = fetch_buffer[31:16]; val0 = fetch_buffer_valid[1];
+                    hw1 = fetch_buffer[47:32]; val1 = fetch_buffer_valid[2];
+                    hw2 = fetch_buffer[63:48]; val2 = fetch_buffer_valid[3];
+                    hw3 = fetch_buffer[79:64]; val3 = fetch_buffer_valid[4];
+                end
+                2'b10: begin
+                    hw0 = fetch_buffer[47:32]; val0 = fetch_buffer_valid[2];
+                    hw1 = fetch_buffer[63:48]; val1 = fetch_buffer_valid[3];
+                    hw2 = fetch_buffer[79:64]; val2 = fetch_buffer_valid[4];
+                    hw3 = 16'h0;               val3 = 1'b0;
+                end
+                2'b11: begin
+                    hw0 = fetch_buffer[63:48]; val0 = fetch_buffer_valid[3];
+                    hw1 = fetch_buffer[79:64]; val1 = fetch_buffer_valid[4];
+                    hw2 = 16'h0;               val2 = 1'b0;
+                    hw3 = 16'h0;               val3 = 1'b0;
+                end
+            endcase
+        end
     end
 
     // Instr 0
     logic i0_is_compressed, i0_have_full;
     logic [31:0] i0_raw;
 
-    assign i0_is_compressed = (hw0[1:0] != 2'b11);
-    // FIX 2: have_full usa validade correta para todas as posições
+    assign i0_is_compressed = (hw0[1:0] != 2'b11) || (hw0[4:2] == 3'b111);
     assign i0_have_full = val0 && (i0_is_compressed || val1);
     assign i0_raw = i0_is_compressed ? {16'h0, hw0} : {hw1, hw0};
 
@@ -130,7 +134,7 @@ module nebula_frontend_rvc #(
             i1_hw0 = hw2; i1_hw1 = hw3;
             i1_val0 = val2; i1_val1 = val3;
         end
-        i1_is_compressed = (i1_hw0[1:0] != 2'b11);
+        i1_is_compressed = (i1_hw0[1:0] != 2'b11) || (i1_hw0[4:2] == 3'b111);
         i1_have_full = i1_val0 && (i1_is_compressed || i1_val1);
         i1_raw = i1_is_compressed ? {16'h0, i1_hw0} : {i1_hw1, i1_hw0};
     end
@@ -168,7 +172,7 @@ module nebula_frontend_rvc #(
         dec.is_compressed = is_comp;
 
         if (is_comp && illegal_comp) begin
-            dec.valid = 1'b0;
+            dec.valid = 1'b1;
             return dec;
         end
 
@@ -282,13 +286,14 @@ module nebula_frontend_rvc #(
         S_ICACHE_REQ, S_ICACHE_WAIT, S_PROCESS, S_DECODE,
         S_STALL, S_FLUSH, S_EXCEPTION
     } state_t;
+    
     state_t state, next_state;
     logic [PPN_WIDTH-1:0] cached_ppn;
     logic                 tlb_done;
 
     always_comb begin
-        instr0_pc = pc_reg;
-        instr1_pc = pc_reg + (i0_is_compressed ? 2 : 4);
+        instr0_pc = fetch_offset[2] ? (pc_reg - 2) : pc_reg;
+        instr1_pc = instr0_pc + (i0_is_compressed ? 2 : 4);
 
         decoded_instr0 = decode_instr(final_instr0, i0_is_compressed, i0_illegal, instr0_pc);
         decoded_instr1 = decode_instr(final_instr1, i1_is_compressed, i1_illegal, instr1_pc);
@@ -334,8 +339,12 @@ module nebula_frontend_rvc #(
         if (hazard_detected) can_dual_issue = 1'b0;
         if (!decoded_instr1.valid) can_dual_issue = 1'b0;
         if (!(decoded_instr1.is_alu || decoded_instr1.is_store)) can_dual_issue = 1'b0;
+        if (decoded_instr0.is_branch || decoded_instr0.is_jal || decoded_instr0.is_jalr ||
+            decoded_instr1.is_branch || decoded_instr1.is_jal || decoded_instr1.is_jalr) begin
+            can_dual_issue = 1'b0;
+        end
         if (decoded_instr0.is_ecall || decoded_instr0.is_ebreak || decoded_instr0.is_mret || 
-            decoded_instr0.is_branch || decoded_instr0.is_load || decoded_instr0.is_store ||
+            decoded_instr0.is_load || decoded_instr0.is_store ||
             decoded_instr0.is_amo || decoded_instr0.is_mdu || decoded_instr0.is_fp) begin
             can_dual_issue = 1'b0;
         end
@@ -355,13 +364,13 @@ module nebula_frontend_rvc #(
 
         if (frontend_valid) begin 
             if (can_dual_issue && decoded_instr1.valid) begin
-                // DESPACHO DUPLO: Consome ambas as instruções do buffer
+                // DESPACHO DUPLO: Usa o instr0_pc corrigido como base
                 consumed_halfwords = hw_len0 + hw_len1;
-                next_pc = pc_reg + (hw_len0 * 2) + (hw_len1 * 2);
+                next_pc = instr0_pc + (hw_len0 * 2) + (hw_len1 * 2);
             end else if (decoded_instr0.valid) begin
-                // ISSUE STALL: Despacha apenas a instr0. A instr1 fica retida no buffer!
+                // ISSUE STALL: Usa o instr0_pc corrigido como base
                 consumed_halfwords = hw_len0;
-                next_pc = pc_reg + (hw_len0 * 2);
+                next_pc = instr0_pc + (hw_len0 * 2);
             end
         end
         fetch_pc = {pc_reg[VADDR_WIDTH-1:3], 3'b000};
@@ -372,29 +381,41 @@ module nebula_frontend_rvc #(
         next_state = state;
         case (state)
             S_RESET:       next_state = S_FETCH_REQ;
+            
             S_FETCH_REQ:   next_state = backend_flush ? S_FLUSH :
                                         (mmu_enabled ? S_TLB_LOOKUP : S_ICACHE_REQ);
+                                        
             S_TLB_LOOKUP:  next_state = backend_flush    ? S_FLUSH :
                                         itlb_page_fault  ? S_EXCEPTION :
                                         itlb_hit         ? S_ICACHE_REQ :
                                         ptw_ready        ? S_TLB_WAIT : S_TLB_LOOKUP;
+                                        
             S_TLB_WAIT:    next_state = backend_flush  ? S_FLUSH :
                                         ptw_resp_valid ? (ptw_page_fault ? S_EXCEPTION : S_TLB_LOOKUP)
                                                        : S_TLB_WAIT;
+                                                       
             S_ICACHE_REQ:  next_state = backend_flush ? S_FLUSH :
                                         icache_ready  ? S_ICACHE_WAIT : S_ICACHE_REQ;
+                                    
             S_ICACHE_WAIT: next_state = backend_flush     ? S_FLUSH :
-                                        icache_resp_valid ? (icache_resp_error ? S_EXCEPTION : S_PROCESS)
+                                        icache_resp_valid ? (icache_resp_error ? S_EXCEPTION : S_DECODE)
                                                           : S_ICACHE_WAIT;
-            S_PROCESS:     next_state = backend_flush ? S_FLUSH :
-                                        i0_have_full  ? S_DECODE : S_FETCH_REQ;
+            
+            S_PROCESS:     next_state = backend_flush ? S_FLUSH : S_FETCH_REQ;
+            
             S_DECODE:      next_state = backend_flush  ? S_FLUSH :
+                                        backend_redirect ? S_FETCH_REQ :
                                         backend_stall  ? S_STALL :
-                                        i0_have_full   ? S_DECODE : S_FETCH_REQ;
+                                        i0_have_full   ? S_DECODE : 
+                                        val0           ? S_PROCESS : S_FETCH_REQ;
+                                        
             S_STALL:       next_state = backend_flush  ? S_FLUSH :
                                         !backend_stall ? S_DECODE : S_STALL;
+                                        
             S_FLUSH:       next_state = S_FETCH_REQ;
+            
             S_EXCEPTION:   next_state = backend_flush ? S_FLUSH : S_EXCEPTION;
+            
             default:       next_state = S_RESET;
         endcase
     end
@@ -457,7 +478,7 @@ module nebula_frontend_rvc #(
                 end
 
                 S_FETCH_REQ: begin
-                    fetch_offset <= {1'b0, pc_reg[2:1]};
+                    fetch_offset <= {fetch_offset[2], pc_reg[2:1]};
                 end
 
                 S_TLB_LOOKUP: begin
@@ -469,11 +490,22 @@ module nebula_frontend_rvc #(
 
                 S_ICACHE_WAIT: begin
                     if (icache_resp_valid && !icache_resp_error) begin
-                        // Se offset[2] estava setado, preserva [79:64] como o halfword extra da linha anterior
-                        if (fetch_offset[2])
-                            fetch_buffer[79:64] <= fetch_buffer[63:48];
-                        fetch_buffer[63:0]  <= icache_resp_data;
-                        fetch_buffer_valid <= fetch_offset[2] ? 5'b1_1111 : 5'b0_1111;
+                        if (fetch_offset[2]) begin
+                            fetch_buffer[79:64]   <= fetch_buffer[63:48];
+                            fetch_buffer_valid[4] <= 1'b1;
+                        end else begin
+                            fetch_buffer_valid[4] <= 1'b0;
+                        end
+                        fetch_buffer[63:0]      <= icache_resp_data;
+                        fetch_buffer_valid[3:0] <= 4'b1111;
+                    end
+                end
+
+                S_PROCESS: begin
+                    // Retém a halfword isolada e avança para a próxima linha de cache
+                    if (!i0_have_full && !backend_flush) begin
+                        pc_reg          <= pc_reg + 2; 
+                        fetch_offset[2] <= 1'b1;       
                     end
                 end
 
@@ -483,18 +515,26 @@ module nebula_frontend_rvc #(
                             pc_reg             <= backend_redirect_pc;
                             fetch_buffer_valid <= '0;
                             fetch_offset       <= '0;
-                        end else if (bp_prediction.valid && bp_prediction.taken) begin
-                            pc_reg             <= bp_prediction.target;
-                            fetch_buffer_valid <= '0;
-                            fetch_offset       <= '0;
                         end else begin
                             pc_reg <= next_pc;
-                            fetch_offset <= fetch_offset + consumed_halfwords;
+                            
+                            // Consumo da instrução mista limpa a flag de fronteira
+                            if (fetch_offset[2]) begin
+                                fetch_offset <= {1'b0, (fetch_offset[1:0] + consumed_halfwords[1:0] - 2'd1) & 2'b11};
+                            end else begin
+                                // Truncamento matemático rigoroso impede que o bit 2 seja ativado por acidente
+                                fetch_offset <= {1'b0, (fetch_offset[1:0] + consumed_halfwords[1:0]) & 2'b11};
+                            end
 
-                            // FIX 3: limpar bits de validade consumidos (5 bits)
+                            // Limpar bits de validade consumidos
                             for (int i = 0; i < 5; i++) begin
-                                if (i < (int'(fetch_offset[1:0]) + int'(consumed_halfwords)))
-                                    fetch_buffer_valid[i] <= 1'b0;
+                                if (fetch_offset[2]) begin
+                                    if (i == 4 || i < (int'(fetch_offset[1:0]) + int'(consumed_halfwords) - 1))
+                                        fetch_buffer_valid[i] <= 1'b0;
+                                end else begin
+                                    if (i < (int'(fetch_offset[1:0]) + int'(consumed_halfwords)))
+                                        fetch_buffer_valid[i] <= 1'b0;
+                                end
                             end
                         end
                     end

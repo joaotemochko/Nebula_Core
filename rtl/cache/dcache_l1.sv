@@ -7,7 +7,6 @@ import nebula_pkg::*;
  * @module dcache_l1
  * @brief Cache de Dados L1 - 32KB, 4-way set associative, write-back
  *
- * CORREÇÕES APLICADAS:
  * 1. Todas as declarações "logic" removidas de dentro de always_ff e
  * always_comb — movidas para sinais de módulo.
  * 2. found_dirty removido do bloco always_comb da FSM e declarado
@@ -52,6 +51,8 @@ module dcache_l1 #(
     output logic                    mem_we,
     output logic [PADDR_WIDTH-1:0]  mem_addr,
     output logic [LINE_SIZE*8-1:0]  mem_wdata,
+    output logic [LINE_SIZE-1:0]    mem_wstrb,
+    output logic                    mem_uncached,
     input  wire                     mem_ack,
     input  wire [LINE_SIZE*8-1:0]   mem_rdata,
     input  wire                     mem_error
@@ -89,7 +90,10 @@ module dcache_l1 #(
         S_AMO_PROCESS,
         S_FLUSH_SCAN,
         S_FLUSH_WB,
-        S_ERROR
+        S_ERROR,
+        S_MMIO_REQ,   
+        S_MMIO_WAIT,  
+        S_MMIO_DONE
     } state_t;
 
     state_t state, next_state;
@@ -144,6 +148,12 @@ module dcache_l1 #(
     logic                        flush_found;
     logic [INDEX_BITS-1:0]       flush_set_next;
     logic [$clog2(NUM_WAYS)-1:0] flush_way_next;
+
+    // =========================================================================
+    // Detecção de MMIO (Memory Mapped I/O)
+    // =========================================================================
+    // Qualquer endereço >= 0x1f0000000 é tratado como Periférico (Uncached)
+    wire is_mmio = (req_addr >= 56'h1f00_0000);
 
     // =========================================================================
     // Tag Comparison (combinacional)
@@ -382,8 +392,12 @@ module dcache_l1 #(
             S_IDLE: begin
                 if (flush_all || flush_addr_valid)
                     next_state = S_FLUSH_SCAN;
-                else if (req_valid && req_ready)
-                    next_state = S_TAG_CHECK;
+                else if (req_valid && req_ready) begin
+                    if (is_mmio)
+                        next_state = S_MMIO_REQ;
+                    else
+                        next_state = S_TAG_CHECK;
+                end
             end
 
             S_TAG_CHECK: begin
@@ -437,6 +451,15 @@ module dcache_l1 #(
                 else if (mem_error) next_state = S_ERROR;
             end
 
+            S_MMIO_REQ:  next_state = S_MMIO_WAIT;
+
+            S_MMIO_WAIT: begin
+                if (mem_ack)        next_state = S_MMIO_DONE;
+                else if (mem_error) next_state = S_ERROR;
+            end
+
+            S_MMIO_DONE: next_state = S_IDLE;
+
             S_ERROR: next_state = S_IDLE;
             default: next_state = S_IDLE;
         endcase
@@ -446,10 +469,12 @@ module dcache_l1 #(
     // Saídas de Memória
     // =========================================================================
     always_comb begin
-        mem_req   = 1'b0;
-        mem_we    = 1'b0;
-        mem_addr  = '0;
-        mem_wdata = '0;
+        mem_req      = 1'b0;
+        mem_we       = 1'b0;
+        mem_addr     = '0;
+        mem_wdata    = '0;
+        mem_wstrb    = {LINE_SIZE{1'b1}};
+        mem_uncached = 1'b0;
 
         case (state)
             S_WRITEBACK_REQ, S_WRITEBACK_WAIT: begin
@@ -469,6 +494,19 @@ module dcache_l1 #(
                 mem_addr = {tag_array[flush_set_idx][flush_way_idx].tag,
                             flush_set_idx, {OFFSET_BITS{1'b0}}};
                 mem_wdata = data_array[flush_set_idx][flush_way_idx];
+            end
+            S_MMIO_REQ, S_MMIO_WAIT: begin
+                mem_req      = (state == S_MMIO_REQ);
+                mem_we       = we_reg;
+                mem_addr     = addr_reg;
+                mem_uncached = 1'b1; 
+                
+                // Colocar a palavra de 64 bits no offset exato do barramento de 512 bits
+                mem_wdata[word_offset_reg * 64 +: 64] = wdata_reg;
+                
+                // Ligar APENAS os bytes que o CPU quer escrever
+                mem_wstrb = '0;
+                mem_wstrb[word_offset_reg * 8 +: 8] = we_reg ? wstrb_reg : 8'hFF;
             end
             default: ;
         endcase
@@ -497,6 +535,22 @@ module dcache_l1 #(
             S_REFILL_DONE: begin
                 if (!we_reg && !is_amo_reg) begin
                     resp_valid = 1'b1;
+                    case (word_offset_reg)
+                        3'd0: resp_rdata = line_buffer[63:0];
+                        3'd1: resp_rdata = line_buffer[127:64];
+                        3'd2: resp_rdata = line_buffer[191:128];
+                        3'd3: resp_rdata = line_buffer[255:192];
+                        3'd4: resp_rdata = line_buffer[319:256];
+                        3'd5: resp_rdata = line_buffer[383:320];
+                        3'd6: resp_rdata = line_buffer[447:384];
+                        3'd7: resp_rdata = line_buffer[511:448];
+                        default: resp_rdata = '0;
+                    endcase
+                end
+            end
+            S_MMIO_DONE: begin
+                resp_valid = 1'b1;
+                if (!we_reg && !is_amo_reg) begin
                     case (word_offset_reg)
                         3'd0: resp_rdata = line_buffer[63:0];
                         3'd1: resp_rdata = line_buffer[127:64];
@@ -636,6 +690,11 @@ module dcache_l1 #(
                                 flush_way_idx <= flush_way_idx + 1;
                             end
                         end
+                    end
+
+                    S_MMIO_WAIT: begin
+                        if (mem_ack)
+                            line_buffer <= mem_rdata;
                     end
 
                     default: ;

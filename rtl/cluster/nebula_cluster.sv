@@ -36,6 +36,8 @@ module nebula_cluster #(
     output logic                      mem_we,
     output logic [PADDR_WIDTH-1:0]    mem_addr,
     output logic [L2_LINE_SIZE*8-1:0] mem_wdata,
+    output logic [L2_LINE_SIZE-1:0]   mem_wstrb,
+    output logic                      mem_uncached,
     input  wire                       mem_ack,
     input  wire [L2_LINE_SIZE*8-1:0]  mem_rdata,
     input  wire                       mem_error,
@@ -63,7 +65,8 @@ module nebula_cluster #(
     logic [PADDR_WIDTH-1:0]    l1i_l2_addr   [NUM_CORES];
     logic                      l1i_l2_ack    [NUM_CORES];
     logic [L1_LINE_SIZE*8-1:0] l1i_l2_data   [NUM_CORES];
-
+    logic [L1_LINE_SIZE-1:0]   l1d_l2_wstrb  [NUM_CORES];
+    logic                      l1d_uncached  [NUM_CORES];
     logic                      l1d_l2_req    [NUM_CORES];
     logic                      l1d_l2_we     [NUM_CORES];
     logic [PADDR_WIDTH-1:0]    l1d_l2_addr   [NUM_CORES];
@@ -74,7 +77,7 @@ module nebula_cluster #(
     logic [4:0]                l1d_l2_amo_op [NUM_CORES];
     logic                      l1d_l2_upgrade[NUM_CORES];
 
-    // FIX 1: sinais de write do PTW (A/D writeback)
+    // Sinais de write do PTW (A/D writeback)
     logic                      ptw_mem_req   [NUM_CORES];
     logic [PADDR_WIDTH-1:0]    ptw_mem_addr  [NUM_CORES];
     logic                      ptw_mem_we    [NUM_CORES];
@@ -109,6 +112,8 @@ module nebula_cluster #(
                 .dmem_we(l1d_l2_we[c]),
                 .dmem_addr(l1d_l2_addr[c]),
                 .dmem_wdata(l1d_l2_wdata[c]),
+                .dmem_wstrb(l1d_l2_wstrb[c]),
+                .dmem_uncached(l1d_uncached[c]),
                 .dmem_ack(l1d_l2_ack[c]),
                 .dmem_rdata(l1d_l2_rdata[c]),
                 .dmem_error(1'b0),
@@ -157,7 +162,7 @@ module nebula_cluster #(
                     core_l2_req[c].wdata     = {'0, ptw_mem_wdata[c]};
                     core_l2_req[c].upgrade   = 1'b0;
                 end
-                else if (l1d_l2_req[c]) begin
+                else if (l1d_l2_req[c] && !l1d_uncached[c]) begin
                     core_l2_req[c].valid    = 1'b1;
                     core_l2_req[c].core_id  = c[$clog2(NUM_CORES)-1:0];
                     core_l2_req[c].is_ifetch = 1'b0;
@@ -197,11 +202,12 @@ module nebula_cluster #(
                 l1i_l2_data[c] = core_l2_resp[c].rdata;
 
                 // D-Cache ack: resposta não-ifetch e PTW não está fazendo write
-                l1d_l2_ack[c]  = core_l2_resp[c].valid &&
+                l1d_l2_ack[c]  = (c == 0 && mmio_req) ? mem_ack :
+                                 (core_l2_resp[c].valid &&
                                   !core_l2_resp[c].is_ifetch &&
-                                  !(ptw_mem_req[c] && ptw_mem_we[c]);
-                l1d_l2_rdata[c] = core_l2_resp[c].rdata;
-
+                                  !(ptw_mem_req[c] && ptw_mem_we[c]));
+                                  
+                l1d_l2_rdata[c] = (c == 0 && mmio_req) ? mem_rdata : core_l2_resp[c].rdata;
                 // PTW ack: qualquer resposta enquanto PTW tem pedido pendente
                 ptw_mem_ack[c] = core_l2_resp[c].valid && ptw_mem_req[c];
 
@@ -223,6 +229,26 @@ module nebula_cluster #(
     endgenerate
 
     // =========================================================================
+    // L2 Bypass para MMIO (Uncached) - Roteamento direto para o AXI
+    // =========================================================================
+    logic mmio_req;
+    assign mmio_req = l1d_l2_req[0] && l1d_uncached[0];
+
+    logic l2_mem_req, l2_mem_we, l2_mem_ack;
+    logic [PADDR_WIDTH-1:0] l2_mem_addr;
+    logic [L2_LINE_SIZE*8-1:0] l2_mem_wdata;
+
+    // Multiplexador: Se for MMIO, passa direto. Senão, passa a L2 Cache.
+    assign mem_req      = mmio_req ? l1d_l2_req[0]   : l2_mem_req;
+    assign mem_we       = mmio_req ? l1d_l2_we[0]    : l2_mem_we;
+    assign mem_addr     = mmio_req ? l1d_l2_addr[0]  : l2_mem_addr;
+    assign mem_wdata    = mmio_req ? l1d_l2_wdata[0] : l2_mem_wdata;
+    assign mem_wstrb    = mmio_req ? l1d_l2_wstrb[0] : {L2_LINE_SIZE{1'b1}};
+    assign mem_uncached = mmio_req;
+
+    assign l2_mem_ack   = mmio_req ? 1'b0 : mem_ack;
+
+    // =========================================================================
     // L2 Cache
     // =========================================================================
     l2_cache #(
@@ -231,11 +257,9 @@ module nebula_cluster #(
         .SIZE_KB(L2_SIZE_KB), .NUM_BANKS(L2_BANKS)
     ) u_l2_cache (
         .clk, .rst_n,
-        .l1_req(core_l2_req),
-        .l1_resp(core_l2_resp),
-        .snoop_req, .snoop_resp,
-        .mem_req, .mem_we, .mem_addr, .mem_wdata,
-        .mem_ack, .mem_rdata, .mem_error
+        .l1_req(core_l2_req), .l1_resp(core_l2_resp), .snoop_req, .snoop_resp,
+        .mem_req(l2_mem_req), .mem_we(l2_mem_we), .mem_addr(l2_mem_addr), .mem_wdata(l2_mem_wdata),
+        .mem_ack(l2_mem_ack), .mem_rdata, .mem_error
     );
 
 endmodule

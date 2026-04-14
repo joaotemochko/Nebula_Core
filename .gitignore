@@ -1,2 +1,4 @@
 LiteX/*
 build/*
+SoC_Simulation/build/*
+SoC_Simulation/bios.txt

@@ -38,7 +38,6 @@ module nebula_backend_fpu #(
     input  wire                     frontend_valid,
     input  frontend_packet_t        frontend_in,
     output backend_ctrl_t           backend_ctrl,
-    output logic [7:0]              backend_dmem_wstrb,
     output bp_update_t              bp_update,
 
     output logic                    dcache_req,
@@ -151,7 +150,7 @@ module nebula_backend_fpu #(
     logic [XLEN-1:0] exec_result0, exec_result1;
     logic [FLEN-1:0] exec_fp_result;
 
-    // FIX 4: alias público para o testbench
+    // alias público para o testbench
     logic [XLEN-1:0] exec_result;
     assign exec_result = exec_result0;
 
@@ -360,8 +359,9 @@ module nebula_backend_fpu #(
 
     always_comb begin
         branch_taken  = 1'b0;
-        branch_target = issue_instr0.pc + 4;
+        branch_target = issue_instr0.pc + (issue_instr0.is_compressed ? 39'd2 : 39'd4);
 
+        // 1. Verifica se a instrução 0 é um salto
         if (issue_instr0.is_jal) begin
             branch_taken  = 1'b1;
             branch_target = issue_instr0.pc + issue_instr0.imm[VADDR_WIDTH-1:0];
@@ -382,6 +382,30 @@ module nebula_backend_fpu #(
             endcase
             if (branch_taken)
                 branch_target = issue_instr0.pc + issue_instr0.imm[VADDR_WIDTH-1:0];
+        end
+        // 2. Se a instr0 não saltou, avalia o ponto cego: a instrução 1!
+        else if (issue_valid1) begin
+            if (issue_instr1.is_jal) begin
+                branch_taken  = 1'b1;
+                branch_target = issue_instr1.pc + issue_instr1.imm[VADDR_WIDTH-1:0];
+            end else if (issue_instr1.is_jalr) begin
+                branch_taken  = 1'b1;
+                branch_target = (issue1_rs1_data[VADDR_WIDTH-1:0] +
+                                 issue_instr1.imm[VADDR_WIDTH-1:0]) & ~{VADDR_WIDTH{1'b0}} &
+                                ~{{(VADDR_WIDTH-1){1'b0}}, 1'b1};
+            end else if (issue_instr1.is_branch) begin
+                case (issue_instr1.funct3)
+                    3'b000: branch_taken = (issue1_rs1_data == issue1_rs2_data);
+                    3'b001: branch_taken = (issue1_rs1_data != issue1_rs2_data);
+                    3'b100: branch_taken = ($signed(issue1_rs1_data) < $signed(issue1_rs2_data));
+                    3'b101: branch_taken = ($signed(issue1_rs1_data) >= $signed(issue1_rs2_data));
+                    3'b110: branch_taken = (issue1_rs1_data < issue1_rs2_data);
+                    3'b111: branch_taken = (issue1_rs1_data >= issue1_rs2_data);
+                    default: branch_taken = 1'b0;
+                endcase
+                if (branch_taken)
+                    branch_target = issue_instr1.pc + issue_instr1.imm[VADDR_WIDTH-1:0];
+            end
         end
     end
 
@@ -570,27 +594,37 @@ module nebula_backend_fpu #(
     // Output Signals
     // =========================================================================
     logic mret_pending, sret_pending;
+    logic [VADDR_WIDTH-1:0] safe_trap_vector;
 
     assign backend_ctrl.stall = (state != S_IDLE);
     assign backend_ctrl.flush = (state == S_TRAP) ||
-                                (state == S_WRITEBACK && (exec_branch_taken || mret_pending || sret_pending));
+                                (state == S_WRITEBACK && (
+                                    (bp_update.valid && bp_update.mispredicted) || 
+                                    mret_pending || 
+                                    sret_pending
+                                ));   
     assign backend_ctrl.redirect = backend_ctrl.flush;
-    assign backend_ctrl.redirect_pc = (state == S_TRAP)     ? trap_vector[VADDR_WIDTH-1:0] :
-                                      (mret_pending)         ? return_pc[VADDR_WIDTH-1:0] :
-                                      (sret_pending)         ? return_pc[VADDR_WIDTH-1:0] :
-                                                               exec_branch_target;
+    
+    // Se o trap_vector for menor que a base da ROM (ex: 0x40), injetamos a base!
+    assign safe_trap_vector = (trap_vector < 39'h10000000) ? 
+                              (trap_vector | 39'h10000000) : 
+                              trap_vector[VADDR_WIDTH-1:0];
+                              
+    assign backend_ctrl.redirect_pc = (state == S_TRAP) ? safe_trap_vector : exec_branch_target;
 
-    assign bp_update.valid       = (state == S_WRITEBACK) && issue_instr0.is_branch;
+    assign bp_update.valid       = (state == S_WRITEBACK) && 
+                                   (issue_instr0.is_branch || issue_instr0.is_jal || issue_instr0.is_jalr ||
+                                   (issue_valid1 && (issue_instr1.is_branch || issue_instr1.is_jal || issue_instr1.is_jalr)));
     assign bp_update.taken       = exec_branch_taken;
     assign bp_update.mispredicted = exec_branch_taken != issue_instr0.bp_pred.taken;
-    assign bp_update.pc          = issue_instr0.pc;
+    assign bp_update.pc          = (issue_valid1 && (issue_instr1.is_branch || issue_instr1.is_jal || issue_instr1.is_jalr)) ? issue_instr1.pc : issue_instr0.pc;
     assign bp_update.target      = exec_branch_target;
-    assign bp_update.is_call     = issue_instr0.is_jal &&
-                                   (issue_instr0.rd == 5'd1 || issue_instr0.rd == 5'd5);
-    assign bp_update.is_ret      = issue_instr0.is_jalr &&
-                                   (issue_instr0.rs1 == 5'd1 || issue_instr0.rs1 == 5'd5);
+    assign bp_update.is_call     = (issue_instr0.is_jal && (issue_instr0.rd == 5'd1 || issue_instr0.rd == 5'd5)) || 
+                                   (issue_valid1 && issue_instr1.is_jal && (issue_instr1.rd == 5'd1 || issue_instr1.rd == 5'd5));
+    assign bp_update.is_ret      = (issue_instr0.is_jalr && (issue_instr0.rs1 == 5'd1 || issue_instr0.rs1 == 5'd5)) ||
+                                   (issue_valid1 && issue_instr1.is_jalr && (issue_instr1.rs1 == 5'd1 || issue_instr1.rs1 == 5'd5));
 
-    // FIX 3: dcache_we considera dual-issue
+    // dcache_we considera dual-issue
     assign dcache_req    = (state == S_MEM_ACCESS);
     assign dcache_we     = is_mem1 ? (issue_instr1.is_store || issue_instr1.is_fp_store) :
                                      (issue_instr0.is_store || issue_instr0.is_fp_store);
@@ -740,7 +774,7 @@ module nebula_backend_fpu #(
                 end
 
                 S_EXECUTE: begin
-                    if (issue_instr0.is_alu)
+                    if (issue_instr0.is_alu || issue_instr0.opcode == 7'b0110111 || issue_instr0.opcode == 7'b0010111)
                         exec_result0 <= alu0_result;
                     else if (issue_instr0.is_jal || issue_instr0.is_jalr)
                         exec_result0 <= {{(XLEN-VADDR_WIDTH){issue_instr0.pc[VADDR_WIDTH-1]}},
@@ -750,7 +784,7 @@ module nebula_backend_fpu #(
                         exec_result0 <= csr_rdata;
 
                     if (issue_valid1) begin
-                        if (issue_instr1.is_alu)
+                        if (issue_instr1.is_alu || issue_instr1.opcode == 7'b0110111 || issue_instr1.opcode == 7'b0010111)
                             exec_result1 <= alu1_result;
                         else if (issue_instr1.is_jal || issue_instr1.is_jalr)
                             exec_result1 <= {{(XLEN-VADDR_WIDTH){issue_instr1.pc[VADDR_WIDTH-1]}},
@@ -881,9 +915,8 @@ module nebula_backend_fpu #(
                             regfile[issue_instr0.rd] <= mem0_result;
                             mem0_rd     <= issue_instr0.rd;
                             mem0_int_we <= 1'b1;
-                        // CORREÇÃO: Bloquear a FPU de escrever "lixo" no x1 e x2!
-                        // Só escreve se não for FPU, OU se for uma conversão específica de Float->Int
-                        end else if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && !issue_instr0.is_branch &&
+                        end else if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && 
+                                     (!issue_instr0.is_branch || issue_instr0.is_jal || issue_instr0.is_jalr) &&
                                      (!issue_instr0.is_fp || (decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE, FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU, FPU_CLASS, FPU_MV_X_W}))) begin
                             regfile[issue_instr0.rd] <= exec_result0;
                             mem0_rd     <= issue_instr0.rd;
@@ -892,7 +925,8 @@ module nebula_backend_fpu #(
                         
                         // 2. Gravar a Instr 1 (ALU, etc)
                         if (issue_valid1) begin
-                            if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && !issue_instr1.is_branch && !issue_instr1.is_fp) begin
+                            if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && 
+                               (!issue_instr1.is_branch || issue_instr1.is_jal || issue_instr1.is_jalr) && !issue_instr1.is_fp) begin
                                 regfile[issue_instr1.rd] <= exec_result1;
                                 mem1_rd     <= issue_instr1.rd;
                                 mem1_int_we <= 1'b1;
@@ -901,7 +935,8 @@ module nebula_backend_fpu #(
                     end else begin
                         
                         // 1. Gravar a Instr 0 (ALU, etc)
-                        if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && !issue_instr0.is_branch &&
+                        if (issue_instr0.rd != 5'd0 && !issue_instr0.is_store && 
+                            (!issue_instr0.is_branch || issue_instr0.is_jal || issue_instr0.is_jalr) &&
                             (!issue_instr0.is_fp || (decoded_fpu_op inside {FPU_CMP_EQ, FPU_CMP_LT, FPU_CMP_LE, FPU_CVT_W, FPU_CVT_WU, FPU_CVT_L, FPU_CVT_LU, FPU_CLASS, FPU_MV_X_W}))) begin
                             regfile[issue_instr0.rd] <= exec_result0;
                             mem0_rd     <= issue_instr0.rd;
@@ -913,7 +948,8 @@ module nebula_backend_fpu #(
                             regfile[issue_instr1.rd] <= mem1_result;
                             mem1_rd     <= issue_instr1.rd;
                             mem1_int_we <= 1'b1;
-                        end else if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && !issue_instr1.is_branch && !issue_instr1.is_fp) begin
+                        end else if (issue_instr1.rd != 5'd0 && !issue_instr1.is_store && 
+                                    (!issue_instr1.is_branch || issue_instr1.is_jal || issue_instr1.is_jalr) && !issue_instr1.is_fp) begin
                             regfile[issue_instr1.rd] <= exec_result1;
                             mem1_rd     <= issue_instr1.rd;
                             mem1_int_we <= 1'b1;
@@ -943,4 +979,65 @@ module nebula_backend_fpu #(
         end
     end
 
+    // =================================================================
+    // RADAR DE DIAGNÓSTICO PROFUNDO (TRAPS E STALLS)
+    // =================================================================
+    // synthesis translate_off
+    logic [31:0] watchdog_timer;
+    
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            watchdog_timer <= 0;
+        end else begin
+            // 1. DETEÇÃO DE EXCEÇÕES (O CPU deu erro?)
+            if (trap_enter) begin
+                $display("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                $display("[NEBULA TRAP] EXCECAO FATAL NO PC: %h", trap_pc);
+                $display("              CAUSA (mcause): %d | SALTANDO PARA: %h", trap_cause, trap_vector);
+                $display("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+            end
+            
+            // 2. DETEÇÃO DE STALL (O CPU congelou à espera de algo?)
+            if (state == S_WRITEBACK) begin
+                watchdog_timer <= 0; // O pipeline andou, reseta o temporizador
+            end else begin
+                watchdog_timer <= watchdog_timer + 1;
+                if (watchdog_timer == 100000) begin
+                    $display("\n[NEBULA WATCHDOG] PIPELINE CONGELADO HÁ 100 MIL CICLOS NO PC: %h", issue_instr0.pc);
+                    $display("                  ESTADO DA FSM: %d", state);
+                end
+            end
+        end
+    end
+    // synthesis translate_on
+
+    // synthesis translate_off
+    always_ff @(posedge clk) begin
+        if (state == S_WRITEBACK) begin
+            // Se for uma instrução de leitura (Load) e o endereço for altíssimo (fora da RAM/ROM)
+            if (issue_instr0.is_load && alu0_result[31:28] >= 4'h8) begin
+                $display("[NEBULA MMIO] Lendo Periferico no Endereco: %h", alu0_result);
+            end
+        end
+    end
+    // synthesis translate_on
+
+    // =================================================================
+    // RADAR DE BATIMENTO CARDÍACO (Heartbeat)
+    // =================================================================
+    // synthesis translate_off
+    logic [31:0] heartbeat_counter;
+    
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            heartbeat_counter <= 0;
+        end else if (state == S_WRITEBACK) begin
+            heartbeat_counter <= heartbeat_counter + 1;
+            if (heartbeat_counter == 100000) begin
+                $display("[NEBULA HEARTBEAT] CPU vivo e varrendo a memoria no PC: %h", issue_instr0.pc);
+                heartbeat_counter <= 0;
+            end
+        end
+    end
+    // synthesis translate_on
 endmodule

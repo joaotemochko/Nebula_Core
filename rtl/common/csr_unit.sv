@@ -462,10 +462,18 @@ module csr_unit #(
                             mstatus[MSTATUS_MPP_HI:MSTATUS_MPP_LO] <= 2'b00;
                     end
                     CSR_MEDELEG:   medeleg <= csr_new_value;
-                    // FIX 2: aplicar MIDELEG_MASK correto
                     CSR_MIDELEG:   mideleg <= csr_new_value & MIDELEG_MASK;
                     CSR_MIE:       mie     <= csr_new_value;
-                    CSR_MTVEC:     mtvec   <= {csr_new_value[XLEN-1:2], 1'b0, csr_new_value[0]};
+                    CSR_MTVEC: begin
+                        // Implementacao WARL (Write Any Values, Reads Legal Values)
+                        // Ancoragem de seguranca: Se o software tentar escrever um offset pequeno (ex: 0x40),
+                        // o hardware faz um OR com a base da ROM (0x10000000) e limpa o bit reservado 1.
+                        if (csr_new_value < 64'h10000000) begin
+                            mtvec <= (csr_new_value | 64'h10000000) & ~64'h2;
+                        end else begin
+                            mtvec <= {csr_new_value[XLEN-1:2], 1'b0, csr_new_value[0]};
+                        end
+                    end
                     CSR_MCOUNTEREN: mcounteren <= csr_new_value;
                     CSR_MSCRATCH:  mscratch <= csr_new_value;
                     CSR_MEPC:      mepc <= {csr_new_value[XLEN-1:1], 1'b0};
