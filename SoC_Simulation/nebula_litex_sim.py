@@ -22,10 +22,10 @@ class NebulaCPU(CPU):
     name                 = "nebula"
     data_width           = 64
     endianness           = "little"
-    gcc_triple           = CPU_GCC_TRIPLE_RISCV64
+    gcc_triple           = ("riscv-none-elf", "riscv64-unknown-elf")
     linker_output_format = "elf64-littleriscv"
     nop                  = "nop"
-    io_regions           = {0xF0000000: 0x40000000}
+    io_regions           = {0xF0000000: 0x10000000}
     family               = "riscv"
     category             = "softcore"
     variants             = ["standard"]
@@ -50,7 +50,7 @@ class NebulaCPU(CPU):
         self.reset_address = 0x10000000
 
         # AXI de 64 bits para o LiteX
-        self.axi      = axi.AXIInterface(data_width=64, address_width=56, id_width=4)
+        self.axi      = axi.AXIInterface(data_width=64, address_width=32, id_width=4)
         self.periph_buses = [self.axi]
         self.memory_buses = [self.axi]
 
@@ -154,8 +154,8 @@ class NebulaSimSoC(SoCCore):
 
         SoCCore.__init__(self, platform, clk_freq=sys_clk_freq,
             cpu_type              = "nebula",
-            integrated_rom_size   = 0x8000,
-            integrated_main_ram_size = 0x100000,
+            integrated_rom_size   = 0x4000,
+            integrated_main_ram_size = 0x400000,
             uart_name             = "sim",
         )
         self.add_constant("ROM_BOOT_ADDRESS", self.mem_map["rom"])
@@ -178,4 +178,4 @@ if __name__ == "__main__":
     sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")
 
-    builder.build(sim_config=sim_config, run=True, trace=True)
+    builder.build(sim_config=sim_config, run=False, trace=True)
