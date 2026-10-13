@@ -37,7 +37,8 @@ module nebula_cluster #(
     parameter int L2_SIZE_KB    = 512,
     parameter int L2_LINE_SIZE  = 64,
     parameter int L2_WAYS       = 8,
-    parameter int L2_BANKS      = 4
+    parameter int L2_BANKS      = 4,
+    parameter logic [63:0] RESET_VECTOR = 64'h0000_0000_1000_0000
 )(
     input  wire                       clk,
     input  wire                       rst_n,
@@ -56,6 +57,8 @@ module nebula_cluster #(
     input  wire [NUM_CORES-1:0]       timer_irq,
     input  wire [NUM_CORES-1:0]       external_irq,
     input  wire [NUM_CORES-1:0]       software_irq,
+    input  wire [NUM_CORES-1:0]       s_external_irq,
+    input  wire [63:0]                mtime,
 
     input  wire                       debug_req,
     output logic [NUM_CORES-1:0]      debug_halted
@@ -118,6 +121,7 @@ module nebula_cluster #(
                 .L1_LINE_SIZE(L1_LINE_SIZE), .L1_WAYS(L1_WAYS)
             ) u_core (
                 .clk, .rst_n,
+                .reset_vector(RESET_VECTOR),
 
                 .imem_req(l1i_l2_req[c]),
                 .imem_addr(l1i_l2_addr[c]),
@@ -152,6 +156,8 @@ module nebula_cluster #(
                 .timer_irq(timer_irq[c]),
                 .external_irq(external_irq[c]),
                 .software_irq(software_irq[c]),
+                .s_external_irq(s_external_irq[c]),
+                .mtime(mtime),
 
                 .debug_req,
                 .debug_halted(debug_halted[c])

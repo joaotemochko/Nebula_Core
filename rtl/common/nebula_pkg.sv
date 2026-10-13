@@ -4,327 +4,212 @@
 
 /**
  * @package nebula_pkg
- * @brief Definições globais para o Nebula Cluster
- * 
- * ISA: RV64GC (RV64IMAFDC + Zicsr + Zifencei)
- * Para: Ubuntu Linux RV64
+ * @brief Definições globais do Nebula Core / Nebula Cluster
+ *
+ * ISA: RV64GC (RV64IMAFDC + Zicsr + Zifencei), M/S/U, Sv39
+ *
+ * Microarquitetura (núcleo): dual-issue in-order, 5 estágios de backend
+ *   F (fetch + BTB/RAS) -> FQ (fila de instruções) -> D (decode/issue x2)
+ *   -> EX (2 ALUs, branch, AGU, DIV/FPU) -> MEM (LSU, MUL) -> WB (commit)
  */
 package nebula_pkg;
 
     // =========================================================================
-    // Parâmetros do Cluster
+    // Parâmetros de arquitetura
     // =========================================================================
-    
-    parameter int NUM_CORES = 4;
+    parameter int NUM_CORES        = 4;
     parameter int CLUSTER_ID_WIDTH = 4;
-    
-    // =========================================================================
-    // Parâmetros de Arquitetura
-    // =========================================================================
-    
-    parameter int XLEN = 64;
-    parameter int FLEN = 64;                 // Double-precision FP
-    parameter int ILEN = 32;                 // Instrução não-comprimida
-    parameter int CLEN = 16;                 // Instrução comprimida
+
+    parameter int XLEN        = 64;
+    parameter int FLEN        = 64;
+    parameter int ILEN        = 32;
+    parameter int CLEN        = 16;
     parameter int PADDR_WIDTH = 56;
-    parameter int VADDR_WIDTH = 39;          // Sv39
-    parameter int VPN_WIDTH = 27;
-    parameter int PPN_WIDTH = 44;
-    parameter int ASID_WIDTH = 16;
-    parameter int NUM_INT_REGS = 32;
-    parameter int NUM_FP_REGS = 32;
-    
-    // =========================================================================
-    // Parâmetros de Cache L1
-    // =========================================================================
-    
-    parameter int L1I_SIZE_KB = 32;
-    parameter int L1I_WAYS = 4;
-    parameter int L1I_LINE_SIZE = 64;
-    parameter int L1I_SETS = (L1I_SIZE_KB * 1024) / (L1I_WAYS * L1I_LINE_SIZE);
-    
-    parameter int L1D_SIZE_KB = 32;
-    parameter int L1D_WAYS = 4;
+    parameter int VADDR_WIDTH = 39;
+    parameter int VPN_WIDTH   = 27;
+    parameter int PPN_WIDTH   = 44;
+    parameter int ASID_WIDTH  = 16;
+
     parameter int L1D_LINE_SIZE = 64;
-    parameter int L1D_SETS = (L1D_SIZE_KB * 1024) / (L1D_WAYS * L1D_LINE_SIZE);
-    
-    // =========================================================================
-    // Parâmetros de Cache L2 (Compartilhado)
-    // =========================================================================
-    
-    parameter int L2_SIZE_KB = 512;          // 512KB compartilhado
-    parameter int L2_WAYS = 8;
-    parameter int L2_LINE_SIZE = 64;
-    parameter int L2_SETS = (L2_SIZE_KB * 1024) / (L2_WAYS * L2_LINE_SIZE);
-    parameter int L2_BANKS = 4;              // 4 bancos para paralelismo
-    
-    // =========================================================================
-    // Parâmetros de TLB
-    // =========================================================================
-    
-    parameter int ITLB_ENTRIES = 32;
-    parameter int DTLB_ENTRIES = 32;
-    parameter int L2_TLB_ENTRIES = 512;      // Shared L2 TLB
-    
-    // =========================================================================
-    // Parâmetros do Branch Predictor
-    // =========================================================================
-    
-    parameter int BTB_ENTRIES = 256;         // Branch Target Buffer
-    parameter int BHT_ENTRIES = 1024;        // Branch History Table
-    parameter int RAS_DEPTH = 8;             // Return Address Stack
-    parameter int GSHARE_HISTORY_LEN = 10;   // Global history bits
-    
-    // =========================================================================
-    // Tipos de Dados Base
-    // =========================================================================
-    
-    typedef logic [XLEN-1:0]        xreg_t;      // Integer register
-    typedef logic [FLEN-1:0]        freg_t;      // FP register
+    parameter int L2_LINE_SIZE  = 64;
+
+    typedef logic [XLEN-1:0]        xreg_t;
+    typedef logic [FLEN-1:0]        freg_t;
     typedef logic [PADDR_WIDTH-1:0] paddr_t;
     typedef logic [VADDR_WIDTH-1:0] vaddr_t;
-    typedef logic [ILEN-1:0]        instr_t;
-    typedef logic [CLEN-1:0]        cinstr_t;    // Compressed instruction
     typedef logic [4:0]             reg_addr_t;
-    typedef logic [11:0]            csr_addr_t;
     typedef logic [$clog2(NUM_CORES)-1:0] core_id_t;
-    
+
     // =========================================================================
-    // Níveis de Privilégio
+    // Privilégio
     // =========================================================================
-    
     typedef enum logic [1:0] {
         PRIV_USER       = 2'b00,
         PRIV_SUPERVISOR = 2'b01,
         PRIV_RESERVED   = 2'b10,
         PRIV_MACHINE    = 2'b11
     } priv_t;
-    
+
     // =========================================================================
-    // Rounding Modes (FPU)
+    // Causas de exceção (mcause, bit de interrupção separado)
     // =========================================================================
-    
+    localparam logic [4:0] EXC_INSTR_MISALIGNED   = 5'd0;
+    localparam logic [4:0] EXC_INSTR_ACCESS_FAULT = 5'd1;
+    localparam logic [4:0] EXC_ILLEGAL_INSTR      = 5'd2;
+    localparam logic [4:0] EXC_BREAKPOINT         = 5'd3;
+    localparam logic [4:0] EXC_LOAD_MISALIGNED    = 5'd4;
+    localparam logic [4:0] EXC_LOAD_ACCESS_FAULT  = 5'd5;
+    localparam logic [4:0] EXC_STORE_MISALIGNED   = 5'd6;
+    localparam logic [4:0] EXC_STORE_ACCESS_FAULT = 5'd7;
+    localparam logic [4:0] EXC_ECALL_U            = 5'd8;
+    localparam logic [4:0] EXC_ECALL_S            = 5'd9;
+    localparam logic [4:0] EXC_ECALL_M            = 5'd11;
+    localparam logic [4:0] EXC_INSTR_PAGE_FAULT   = 5'd12;
+    localparam logic [4:0] EXC_LOAD_PAGE_FAULT    = 5'd13;
+    localparam logic [4:0] EXC_STORE_PAGE_FAULT   = 5'd15;
+
+    // =========================================================================
+    // Unidades funcionais / classes de micro-op
+    // =========================================================================
+    typedef enum logic [3:0] {
+        FU_ALU    = 4'd0,
+        FU_BRANCH = 4'd1,   // branch condicional
+        FU_JAL    = 4'd2,
+        FU_JALR   = 4'd3,
+        FU_LOAD   = 4'd4,   // inclui FLW/FLD
+        FU_STORE  = 4'd5,   // inclui FSW/FSD
+        FU_AMO    = 4'd6,   // LR/SC/AMO*
+        FU_MUL    = 4'd7,
+        FU_DIV    = 4'd8,
+        FU_FPU    = 4'd9,
+        FU_CSR    = 4'd10,
+        FU_SYS    = 4'd11,  // MRET/SRET/WFI/SFENCE.VMA/FENCE.I/FENCE
+        FU_NONE   = 4'd15   // instrução que só gera exceção
+    } fu_t;
+
+    typedef enum logic [3:0] {
+        ALU_ADD  = 4'd0,
+        ALU_SUB  = 4'd1,
+        ALU_SLL  = 4'd2,
+        ALU_SLT  = 4'd3,
+        ALU_SLTU = 4'd4,
+        ALU_XOR  = 4'd5,
+        ALU_SRL  = 4'd6,
+        ALU_SRA  = 4'd7,
+        ALU_OR   = 4'd8,
+        ALU_AND  = 4'd9
+    } alu_op_t;
+
     typedef enum logic [2:0] {
-        RM_RNE = 3'b000,  // Round to Nearest, ties to Even
-        RM_RTZ = 3'b001,  // Round towards Zero
-        RM_RDN = 3'b010,  // Round Down (towards -∞)
-        RM_RUP = 3'b011,  // Round Up (towards +∞)
-        RM_RMM = 3'b100,  // Round to Nearest, ties to Max Magnitude
-        RM_DYN = 3'b111   // Dynamic (use frm CSR)
-    } rounding_mode_t;
-    
-    // =========================================================================
-    // FPU Exception Flags
-    // =========================================================================
-    
-    typedef struct packed {
-        logic NV;  // Invalid Operation
-        logic DZ;  // Divide by Zero
-        logic OF;  // Overflow
-        logic UF;  // Underflow
-        logic NX;  // Inexact
-    } fflags_t;
-    
-    // =========================================================================
-    // FPU Operation Types
-    // =========================================================================
-    
+        SYS_NONE   = 3'd0,
+        SYS_MRET   = 3'd1,
+        SYS_SRET   = 3'd2,
+        SYS_WFI    = 3'd3,
+        SYS_SFENCE = 3'd4,
+        SYS_FENCEI = 3'd5,
+        SYS_FENCE  = 3'd6
+    } sys_op_t;
+
+    // Operações da FPU (decodificadas no estágio D)
     typedef enum logic [4:0] {
-        FPU_ADD,
-        FPU_SUB,
-        FPU_MUL,
-        FPU_DIV,
-        FPU_SQRT,
-        FPU_SGNJ,       // Sign injection
-        FPU_SGNJN,
-        FPU_SGNJX,
-        FPU_MIN,
-        FPU_MAX,
-        FPU_CVT_W,      // Convert to int32
-        FPU_CVT_WU,     // Convert to uint32
-        FPU_CVT_L,      // Convert to int64
-        FPU_CVT_LU,     // Convert to uint64
-        FPU_CVT_S,      // Convert to single
-        FPU_CVT_D,      // Convert to double
-        FPU_CVT_INT,    // Convert from int
-        FPU_MV_X_W,     // Move to integer reg
-        FPU_MV_W_X,     // Move from integer reg
-        FPU_CLASS,      // Classify
-        FPU_CMP_EQ,     // Compare equal
-        FPU_CMP_LT,     // Compare less than
-        FPU_CMP_LE,     // Compare less or equal
-        FPU_MADD,       // Fused multiply-add
-        FPU_MSUB,       // Fused multiply-sub
-        FPU_NMADD,      // Negated fused multiply-add
-        FPU_NMSUB       // Negated fused multiply-sub
+        FOP_ADD    = 5'd0,
+        FOP_SUB    = 5'd1,
+        FOP_MUL    = 5'd2,
+        FOP_DIV    = 5'd3,
+        FOP_SQRT   = 5'd4,
+        FOP_SGNJ   = 5'd5,
+        FOP_SGNJN  = 5'd6,
+        FOP_SGNJX  = 5'd7,
+        FOP_MIN    = 5'd8,
+        FOP_MAX    = 5'd9,
+        FOP_CVT_FF = 5'd10,  // fcvt.s.d / fcvt.d.s
+        FOP_CVT_IF = 5'd11,  // fcvt.{w,wu,l,lu}.{s,d} (fp -> int)
+        FOP_CVT_FI = 5'd12,  // fcvt.{s,d}.{w,wu,l,lu} (int -> fp)
+        FOP_MV_XF  = 5'd13,  // fmv.x.w / fmv.x.d
+        FOP_MV_FX  = 5'd14,  // fmv.w.x / fmv.d.x
+        FOP_CLASS  = 5'd15,
+        FOP_EQ     = 5'd16,
+        FOP_LT     = 5'd17,
+        FOP_LE     = 5'd18,
+        FOP_MADD   = 5'd19,
+        FOP_MSUB   = 5'd20,
+        FOP_NMSUB  = 5'd21,
+        FOP_NMADD  = 5'd22
     } fpu_op_t;
-    
+
     // =========================================================================
-    // Causas de Exceção
+    // Micro-op (saída do decodificador, carregada pelo pipeline)
     // =========================================================================
-    
-    typedef enum logic [5:0] {
-        EXC_INSTR_MISALIGNED    = 6'd0,
-        EXC_INSTR_ACCESS_FAULT  = 6'd1,
-        EXC_ILLEGAL_INSTR       = 6'd2,
-        EXC_BREAKPOINT          = 6'd3,
-        EXC_LOAD_MISALIGNED     = 6'd4,
-        EXC_LOAD_ACCESS_FAULT   = 6'd5,
-        EXC_STORE_MISALIGNED    = 6'd6,
-        EXC_STORE_ACCESS_FAULT  = 6'd7,
-        EXC_ECALL_U             = 6'd8,
-        EXC_ECALL_S             = 6'd9,
-        EXC_ECALL_M             = 6'd11,
-        EXC_INSTR_PAGE_FAULT    = 6'd12,
-        EXC_LOAD_PAGE_FAULT     = 6'd13,
-        EXC_STORE_PAGE_FAULT    = 6'd15
-    } exception_cause_t;
-    
-    // =========================================================================
-    // Branch Prediction Types
-    // =========================================================================
-    
     typedef struct packed {
         logic           valid;
-        logic           taken;
-        vaddr_t         target;
-        logic           is_call;
-        logic           is_ret;
-        logic [1:0]     confidence;    // 2-bit saturating counter
-    } bp_prediction_t;
-    
+        logic [63:0]    pc;
+        logic [31:0]    instr;       // bits originais (16b zero-extend p/ RVC)
+        logic           is_rvc;
+        fu_t            fu;
+        // operandos
+        logic [4:0]     rs1, rs2, rs3, rd;
+        logic           rs1_en, rs2_en, rs3_en, rd_en;
+        logic           rs1_fp, rs2_fp, rd_fp;   // rs3 é sempre FP
+        logic [63:0]    imm;
+        // ALU
+        alu_op_t        alu_op;
+        logic           op_a_pc;     // operando A = PC (AUIPC)
+        logic           op_a_zero;   // operando A = 0 (LUI)
+        logic           op_b_imm;    // operando B = imediato
+        logic           word;        // operação *W (32 bits)
+        logic [2:0]     funct3;      // cond. de branch / tamanho mem / op mul-div / op csr
+        // memória
+        logic           mem_fp;      // FLW/FLD/FSW/FSD
+        logic [4:0]     amo_op;      // funct5 do AMO
+        // FPU
+        fpu_op_t        fop;
+        logic           fp_dbl;      // formato D (senão S)
+        logic           fp_src_dbl;  // formato da fonte em FCVT.S.D/D.S
+        logic [1:0]     fp_int_sz;   // 0=W 1=WU 2=L 3=LU (conversões)
+        logic [2:0]     rm;          // rounding mode já resolvido (DYN -> frm)
+        // sistema
+        logic [11:0]    csr;
+        sys_op_t        sys;
+        logic           serial;      // serializante: emite sozinho, flush no commit
+        // exceção detectada no front/decode
+        logic           exc;
+        logic [4:0]     exc_cause;
+        logic [63:0]    exc_tval;
+        // predição
+        logic           pred_taken;
+        logic [63:0]    pred_target;
+    } uop_t;
+
+    // =========================================================================
+    // FPU flags
+    // =========================================================================
     typedef struct packed {
-        logic           valid;
-        logic           taken;
-        logic           mispredicted;
-        vaddr_t         pc;
-        vaddr_t         target;
-        logic           is_call;
-        logic           is_ret;
-    } bp_update_t;
-    
+        logic NV;
+        logic DZ;
+        logic OF;
+        logic UF;
+        logic NX;
+    } fflags_t;
+
+    typedef enum logic [2:0] {
+        RM_RNE = 3'b000,
+        RM_RTZ = 3'b001,
+        RM_RDN = 3'b010,
+        RM_RUP = 3'b011,
+        RM_RMM = 3'b100,
+        RM_DYN = 3'b111
+    } rounding_mode_t;
+
     // =========================================================================
-    // Estrutura de Instrução Decodificada
+    // Tipos legados usados pelo cluster / L2 (mantidos por compatibilidade)
     // =========================================================================
-    
-    typedef struct packed {
-        logic [6:0]     opcode;
-        reg_addr_t      rd;
-        logic [2:0]     funct3;
-        reg_addr_t      rs1;
-        reg_addr_t      rs2;
-        reg_addr_t      rs3;           // Para FMA
-        logic [6:0]     funct7;
-        xreg_t          imm;
-        csr_addr_t      csr_addr;
-        logic           valid;
-        logic           is_compressed;
-        // Integer
-        logic           is_alu;
-        logic           is_alu_w;
-        logic           is_branch;
-        logic           is_jal;
-        logic           is_jalr;
-        logic           is_load;
-        logic           is_store;
-        logic           is_amo;
-        logic           is_lr;
-        logic           is_sc;
-        logic           is_mdu;
-        // FP
-        logic           is_fp;
-        logic           is_fp_load;
-        logic           is_fp_store;
-        logic           is_fma;        // Fused multiply-add
-        logic           is_fp_single;  // Single precision
-        logic           is_fp_double;  // Double precision
-        fpu_op_t        fpu_op;
-        rounding_mode_t rm;
-        // System
-        logic           is_csr;
-        logic           is_fence;
-        logic           is_fence_i;
-        logic           is_sfence_vma;
-        logic           is_ecall;
-        logic           is_ebreak;
-        logic           is_mret;
-        logic           is_sret;
-        logic           is_wfi;
-        // PC
-        vaddr_t         pc;
-        // Branch prediction
-        bp_prediction_t bp_pred;
-    } decoded_instr_t;
-    
-    // =========================================================================
-    // Resultado de Execução
-    // =========================================================================
-    
-    typedef struct packed {
-        xreg_t          result;
-        freg_t          fp_result;
-        vaddr_t         mem_addr;
-        xreg_t          store_data;
-        freg_t          fp_store_data;
-        reg_addr_t      rd;
-        logic [7:0]     mem_wstrb;
-        logic           int_reg_we;
-        logic           fp_reg_we;
-        logic           mem_we;
-        logic           mem_re;
-        logic           is_fp_mem;     // FP load/store
-        logic           branch_taken;
-        vaddr_t         branch_target;
-        logic           is_amo;
-        logic           is_lr;
-        logic           is_sc;
-        logic [4:0]     amo_op;
-        logic           amo_aq;
-        logic           amo_rl;
-        logic [2:0]     mem_size;
-        logic           trap;
-        exception_cause_t trap_cause;
-        xreg_t          trap_value;
-        vaddr_t         pc;
-        fflags_t        fflags;        // FPU exception flags
-        bp_prediction_t bp_pred;       // For update
-    } exec_result_t;
-    
-    // =========================================================================
-    // Interface Frontend -> Backend
-    // =========================================================================
-    
-    typedef struct packed {
-        decoded_instr_t instr0;
-        decoded_instr_t instr1;
-        logic           instr0_valid;
-        logic           instr1_valid;
-        logic           dual_issue;
-    } frontend_packet_t;
-    
-    // =========================================================================
-    // Interface Backend -> Frontend
-    // =========================================================================
-    
-    typedef struct packed {
-        logic           stall;
-        logic           flush;
-        logic           redirect;
-        vaddr_t         redirect_pc;
-        bp_update_t     bp_update;
-    } backend_ctrl_t;
-    
-    // =========================================================================
-    // Cache Coherence (MESI-like)
-    // =========================================================================
-    
     typedef enum logic [1:0] {
         CACHE_INVALID   = 2'b00,
         CACHE_SHARED    = 2'b01,
         CACHE_EXCLUSIVE = 2'b10,
         CACHE_MODIFIED  = 2'b11
     } cache_state_t;
-    
+
     typedef enum logic [2:0] {
         COH_NONE,
         COH_READ,
@@ -333,11 +218,7 @@ package nebula_pkg;
         COH_WRITEBACK,
         COH_INVALIDATE
     } coherence_op_t;
-    
-    // =========================================================================
-    // L2 Request/Response
-    // =========================================================================
-    
+
     typedef struct packed {
         logic           valid;
         core_id_t       core_id;
@@ -347,9 +228,9 @@ package nebula_pkg;
         logic [4:0]     amo_op;
         paddr_t         addr;
         logic [L1D_LINE_SIZE*8-1:0] wdata;
-        logic           upgrade;       // Shared -> Modified
+        logic           upgrade;
     } l2_req_t;
-    
+
     typedef struct packed {
         logic           valid;
         core_id_t       core_id;
@@ -358,50 +239,21 @@ package nebula_pkg;
         logic           error;
         cache_state_t   state;
     } l2_resp_t;
-    
-    // =========================================================================
-    // Snoop Interface (Coherence)
-    // =========================================================================
-    
+
     typedef struct packed {
         logic           valid;
         coherence_op_t  op;
         paddr_t         addr;
         core_id_t       requester;
     } snoop_req_t;
-    
+
     typedef struct packed {
         logic           valid;
         logic           has_data;
         logic [L1D_LINE_SIZE*8-1:0] data;
         cache_state_t   state;
     } snoop_resp_t;
-    
-    // =========================================================================
-    // Funções Auxiliares
-    // =========================================================================
-    
-    function automatic xreg_t sign_extend_load(
-        input xreg_t data,
-        input logic [2:0] size
-    );
-        case (size)
-            3'b000: return {{56{data[7]}}, data[7:0]};
-            3'b001: return {{48{data[15]}}, data[15:0]};
-            3'b010: return {{32{data[31]}}, data[31:0]};
-            3'b011: return data;
-            3'b100: return {56'b0, data[7:0]};
-            3'b101: return {48'b0, data[15:0]};
-            3'b110: return {32'b0, data[31:0]};
-            default: return data;
-        endcase
-    endfunction
-    
-    // Check if instruction is compressed (16-bit)
-    function automatic logic is_compressed_instr(input logic [15:0] instr);
-        return (instr[1:0] != 2'b11);
-    endfunction
-    
+
 endpackage
 
 `endif

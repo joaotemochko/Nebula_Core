@@ -88,6 +88,13 @@ module nebula_core_axi_top #(
     wire [3:0] external_irqs = {4{i_external_irq}};
     wire [3:0] software_irqs = {4{i_software_irq}};
 
+    // contador de tempo real local (CSR time); o CLINT do SoC deve fornecer
+    // mtime em integrações completas
+    logic [63:0] mtime_cnt;
+    always_ff @(posedge clk or negedge rst_n)
+        if (!rst_n) mtime_cnt <= '0;
+        else        mtime_cnt <= mtime_cnt + 64'd1;
+
     // Dummy I-Cache (imem_req=0 — Opção A)
     logic        dummy_imem_ack;
     logic [511:0] dummy_imem_data;
@@ -120,6 +127,8 @@ module nebula_core_axi_top #(
         .timer_irq    (timer_irqs),
         .external_irq (external_irqs),
         .software_irq (software_irqs),
+        .s_external_irq ('0),
+        .mtime        (mtime_cnt),
 
         .debug_req    (1'b0),
         .debug_halted ()
