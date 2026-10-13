@@ -245,11 +245,16 @@ module nebula_csr #(
 
     // valor a escrever
     logic [63:0] wval;
+    // Em read-modify-write de mip/sip, o bit SEIP lido inclui o pino externo;
+    // a escrita deve usar apenas o bit de software (Priv. Spec 3.1.9).
+    logic [63:0] rmw_src;
     always_comb begin
+        rmw_src = rdata;
+        if (csr_addr == 12'h344) rmw_src[9] = mip_seip;
         case (csr_op[1:0])
             2'b01:   wval = csr_wsrc;
-            2'b10:   wval = rdata | csr_wsrc;
-            default: wval = rdata & ~csr_wsrc;
+            2'b10:   wval = rmw_src | csr_wsrc;
+            default: wval = rmw_src & ~csr_wsrc;
         endcase
     end
 

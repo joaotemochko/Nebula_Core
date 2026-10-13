@@ -253,7 +253,7 @@ struct Soc {
             uint64_t aw = a & ~7ULL;
             if (aw == FIN_BASE) {
                 uint32_t w = (uint32_t)v;
-                if ((w & 0xFFFF) == 0x5555) { finished = true; exit_code = 0; }
+                if ((w & 0xFFFF) == 0x5555 || (w & 0xFFFF) == 0x7777) { finished = true; exit_code = 0; }
                 else if ((w & 0xFFFF) == 0x3333) { finished = true; exit_code = (int)(w >> 16) ? (int)(w >> 16) : 1; }
             }
             return true;
@@ -377,6 +377,7 @@ int main(int argc, char** argv) {
     int mtime_div = 100, rd_lat = 10, wr_lat = 2, ptw_lat = 10;
     uint64_t heartbeat = 0;
     uint64_t stall_limit = 50000000;
+    uint64_t trace_from = 0;
     std::vector<std::string> expects, sends;
     uint64_t last_pc = 0;
     uint64_t stats_from = 0;
@@ -392,6 +393,7 @@ int main(int argc, char** argv) {
         else if (const char* v = val("--rd-lat=")) rd_lat = atoi(v);
         else if (const char* v = val("--heartbeat=")) heartbeat = strtoull(v, nullptr, 0);
         else if (const char* v = val("--stall-limit=")) stall_limit = strtoull(v, nullptr, 0);
+        else if (const char* v = val("--trace-from=")) trace_from = strtoull(v, nullptr, 0);
         else if (const char* v = val("--expect=")) expects.push_back(v);
         else if (const char* v = val("--send=")) {
             std::string t;
@@ -498,6 +500,8 @@ int main(int argc, char** argv) {
                         uint64_t th = data;
                         if (th & 1) { tohost_done = true; ret = (int)(th >> 1); }
                     }
+                    if (dp.unc && tf && g_cycle >= trace_from)
+                        fprintf(tf, "%lu MMIO W 0x%lx be=%02x data=0x%lx\n", (unsigned long)g_cycle, (unsigned long)aw, be, (unsigned long)data);
                     if (dp.unc) ok &= soc.uncached_write(aw, data, be);
                     else {
                         if (uint8_t* p = soc.ptr(aw)) {
@@ -511,6 +515,8 @@ int main(int argc, char** argv) {
                 uint8_t be = (dp.wstrb >> (8 * ((dp.addr >> 3) & 7))) & 0xFF;
                 uint64_t v = 0;
                 ok = soc.uncached_read(aw, be, v);
+                if (tf && g_cycle >= trace_from)
+                    fprintf(tf, "%lu MMIO R 0x%lx be=%02x data=0x%lx\n", (unsigned long)g_cycle, (unsigned long)aw, be, (unsigned long)v);
                 for (int w = 0; w < 16; w++) top->dmem_rdata[w] = 0;
                 int lane = (dp.addr >> 3) & 7;
                 top->dmem_rdata[2 * lane] = (uint32_t)v;
@@ -559,7 +565,7 @@ int main(int argc, char** argv) {
             unsigned rd = (top->trace_rd >> (5 * s)) & 31;
             uint64_t rv = (uint64_t)top->trace_rd_val[2 * s] | ((uint64_t)top->trace_rd_val[2 * s + 1] << 32);
             bool mmio = (top->trace_mmio >> s) & 1;
-            if (tf) {
+            if (tf && g_cycle >= trace_from) {
                 fprintf(tf, "%lu %d 0x%016lx (0x%08x)", (unsigned long)g_cycle, (int)top->trace_priv, (unsigned long)pc, insn);
                 if (rd_en) fprintf(tf, " %c%-2u 0x%016lx", rd_fp ? 'f' : 'x', rd, (unsigned long)rv);
                 fprintf(tf, "\n");
@@ -570,11 +576,13 @@ int main(int argc, char** argv) {
             }
         }
         if (top->trace_trap) {
-            if (tf) fprintf(tf, "%lu trap %s cause=%u epc=0x%016lx tval=0x%016lx\n", (unsigned long)g_cycle,
+            if (tf && g_cycle >= trace_from) fprintf(tf, "%lu trap %s cause=%u epc=0x%016lx tval=0x%016lx\n", (unsigned long)g_cycle,
                             top->trace_trap_intr ? "intr" : "exc", (unsigned)top->trace_trap_cause,
                             (unsigned long)top->trace_trap_epc, (unsigned long)top->trace_trap_tval);
+            uint64_t pins = ((uint64_t)top->timer_irq << 7) | ((uint64_t)top->software_irq << 3) |
+                            ((uint64_t)top->external_irq << 11) | ((uint64_t)top->s_external_irq << 9);
             if (cs && !cs->trap(top->trace_trap_intr, top->trace_trap_cause, top->trace_trap_epc,
-                                top->trace_trap_tval, g_cycle)) {
+                                top->trace_trap_tval, pins, g_cycle)) {
                 fprintf(stderr, "[cosim] divergência em trap no ciclo %lu\n", (unsigned long)g_cycle);
                 ret = 3; goto done;
             }

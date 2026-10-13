@@ -165,14 +165,12 @@ public:
         return true;
     }
 
-    bool trap(bool intr, unsigned cause, uint64_t epc, uint64_t tval, uint64_t cycle) override {
+    bool trap(bool intr, unsigned cause, uint64_t epc, uint64_t tval, uint64_t pins, uint64_t cycle) override {
         state_t* s = proc->get_state();
         if (s->pc != epc) { dump("PC divergente (trap)", epc, 0, cycle); return false; }
         s->mip->backdoor_write_with_mask(EXT_MIP, 0);
-        if (intr) {
-            reg_t bit = 1ULL << cause;
-            if (bit & EXT_MIP) s->mip->backdoor_write_with_mask(bit, bit);
-        }
+        // apresenta ao Spike apenas os pinos externos realmente ativos
+        if (intr) s->mip->backdoor_write_with_mask(EXT_MIP, pins & EXT_MIP);
         bool trapped = spike_step();
         s->mip->backdoor_write_with_mask(EXT_MIP, 0);
         if (!trapped) {

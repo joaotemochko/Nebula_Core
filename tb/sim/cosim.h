@@ -14,5 +14,6 @@ public:
     virtual bool step(uint64_t pc, uint32_t insn, bool rd_en, bool rd_fp, unsigned rd,
                       uint64_t rd_val, bool mmio, uint64_t cycle) = 0;
     // trap (exceção ou interrupção) tomado pelo RTL
-    virtual bool trap(bool intr, unsigned cause, uint64_t epc, uint64_t tval, uint64_t cycle) = 0;
+    // pins: bits MIP dos pinos externos (MTIP/MSIP/MEIP/SEIP) ativos no instante do trap
+    virtual bool trap(bool intr, unsigned cause, uint64_t epc, uint64_t tval, uint64_t pins, uint64_t cycle) = 0;
 };
