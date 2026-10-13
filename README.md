@@ -19,13 +19,13 @@ Estado verificado (simulação Verilator):
 | Verificação | Resultado |
 |---|---|
 | riscv-tests (rv64ui/um/ua/uc/uf/ud/si/mi, ambientes `-p` e `-v`) | **244/244** |
-| Testes dirigidos (PMA, PMP aleatório, ASID/SFENCE, desalinhados, triggers) | **5/5** |
+| Testes dirigidos (PMA, PMP aleatório, ASID/SFENCE, desalinhados, triggers, SMP) | **6/6** |
 | Co-simulação lockstep com Spike (toda instrução comparada) | sem divergências em ISA, testes dirigidos, Embench e boot do Linux |
 | Embench IoT (19 benchmarks) | **19/19 corretos**, IPC média geométrica **1.28**, IPC ≥ 1.0 em **18/19** |
 | SMP bare-metal (AMO, LR/SC, spinlock, compartilhamento falso, passagem de mensagem) | 1, 2 e 4 harts |
 | Ponte AXI4 (escravo com atrasos aleatórios) | ISA 244/244, dirigidos 5/5, SMP 4 harts |
 | Linux 6.19 (OpenSBI 1.7 + kernel + initramfs BusyBox/glibc), 1 hart | boot até o shell, comandos, `poweroff` (também sob cosim) |
-| Linux SMP | ver seção [Linux](#linux) |
+| Linux 6.19 SMP (kernel `CONFIG_SMP=y`), 2 e 4 harts | "Brought up 1 node, N CPUs", 4× `md5sum` paralelos corretos, `poweroff` |
 
 ## Microarquitetura do núcleo
 
@@ -190,6 +190,9 @@ make ARCH=riscv CROSS_COMPILE=riscv64-buildroot-linux-gnu- olddefconfig Image -j
 cd ../../.. && make -C tb/sim NCORES=4
 NCORES=4 KERNEL=build/linux-smp/src/arch/riscv/boot/Image linux/run_linux.sh
 ```
+
+Boot completo + 4 `md5sum` em paralelo + `poweroff`: ~528M ciclos com 2 harts, ~544M com 4 harts.
+A saída do console só começa após ~60–100M ciclos (OpenSBI + descompressão/early boot).
 
 ## Limitações conhecidas
 
