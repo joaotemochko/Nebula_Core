@@ -25,9 +25,9 @@
 			reg = <0>;
 			status = "okay";
 			compatible = "riscv";
-			riscv,isa = "rv64imafdc_zicsr_zifencei_zicntr";
+			riscv,isa = "rv64imafdc_zicsr_zifencei_zicntr_zicclsm";
 			riscv,isa-base = "rv64i";
-			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr";
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr", "zicclsm";
 			mmu-type = "riscv,sv39";
 			clock-frequency = <100000000>;
 

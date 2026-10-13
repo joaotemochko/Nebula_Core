@@ -27,6 +27,9 @@ import nebula_pkg::*;
  */
 module nebula_core_full #(
     parameter int          HART_ID      = 0,
+    parameter logic [PMA_N-1:0][55:0] PMA_BASE = PMA_DEF_BASE,
+    parameter logic [PMA_N-1:0][55:0] PMA_SIZE = PMA_DEF_SIZE,
+    parameter logic [PMA_N-1:0][2:0]  PMA_ATTR = PMA_DEF_ATTR,
     parameter int          XLEN         = 64,
     parameter int          FLEN         = 64,
     parameter int          PADDR_WIDTH  = 56,
@@ -95,8 +98,6 @@ module nebula_core_full #(
     output logic [1:0]                trace_priv
 );
 
-    assign dmem_is_amo    = 1'b0;
-    assign dmem_amo_op    = '0;
     assign dmem_upgrade   = 1'b0;
     assign snoop_resp_out = '0;
     assign debug_halted   = 1'b0;
@@ -111,6 +112,15 @@ module nebula_core_full #(
     logic        mprv, sum, mxr, tvm, tw, tsr;
     logic [1:0]  mpp, fs;
     logic [2:0]  frm;
+    logic [15:0][7:0]  pmpcfg;
+    trig_t [NTRIG-1:0] trig;
+    logic        st_mie, st_sie, deleg_bp;
+    logic        any_ex_trig;
+    logic        trig_hit_we;
+    logic [NTRIG-1:0][1:0] trig_hit_val;
+    logic [15:0][53:0] pmpaddr;
+    logic [15:0][57:0] pmp_lo, pmp_hi;
+    logic              pmp_any_locked;
     logic        irq_pending, wfi_wake, csr_tlb_flush;
     logic [4:0]  irq_cause;
 
@@ -126,6 +136,9 @@ module nebula_core_full #(
     logic [63:0] d_redirect_pc;
     logic        mem_stall, mem_adv, ex_busy, ex_adv;
     logic        tlb_flush_all;
+    logic        sf_va, sf_asid;
+    logic [26:0] sf_vpn;
+    logic [15:0] sf_asid_val;
     logic        icache_inval;
     logic        sb_empty;
 
@@ -135,19 +148,20 @@ module nebula_core_full #(
     logic        ptw_busy, ptw_resp_valid, ptw_resp_for_d, ptw_resp_page_fault;
     logic        ptw_resp_access_fault, ptw_resp_insert;
     logic [26:0] ptw_resp_vpn;
+    logic [15:0] ptw_resp_asid;
     logic [43:0] ptw_resp_ppn;
     logic [1:0]  ptw_resp_level;
     logic [7:0]  ptw_resp_flags;
     logic        ptw_req_i, ptw_req_d;
     logic [26:0] ptw_vpn_i, ptw_vpn_d;
 
-    nebula_ptw u_ptw (
+    nebula_ptw #(.PMA_BASE(PMA_BASE), .PMA_SIZE(PMA_SIZE), .PMA_ATTR(PMA_ATTR)) u_ptw (
         .clk, .rst_n,
-        .satp, .sb_empty, .flush(tlb_flush_all),
+        .satp, .sb_empty, .flush(tlb_flush_all), .pmpcfg, .pmp_lo, .pmp_hi, .pmp_any_locked,
         .req_i(ptw_req_i), .vpn_i(ptw_vpn_i),
         .req_d(ptw_req_d), .vpn_d(ptw_vpn_d),
         .busy(ptw_busy),
-        .resp_valid(ptw_resp_valid), .resp_for_d(ptw_resp_for_d), .resp_vpn(ptw_resp_vpn),
+        .resp_valid(ptw_resp_valid), .resp_for_d(ptw_resp_for_d), .resp_vpn(ptw_resp_vpn), .resp_asid(ptw_resp_asid),
         .resp_page_fault(ptw_resp_page_fault), .resp_access_fault(ptw_resp_access_fault),
         .resp_insert(ptw_resp_insert), .resp_ppn(ptw_resp_ppn),
         .resp_level(ptw_resp_level), .resp_flags(ptw_resp_flags),
@@ -181,7 +195,7 @@ module nebula_core_full #(
         f_redirect_pc = wb_flush ? wb_redirect_pc : ex_redirect ? ex_redirect_pc : d_redirect_pc;
     end
 
-    nebula_fetch u_fetch (
+    nebula_fetch #(.PMA_BASE(PMA_BASE), .PMA_SIZE(PMA_SIZE), .PMA_ATTR(PMA_ATTR)) u_fetch (
         .clk, .rst_n, .reset_vector,
         .redirect(f_redirect), .redirect_pc(f_redirect_pc),
         .ras_recover(wb_flush || ex_redirect),
@@ -189,9 +203,9 @@ module nebula_core_full #(
         .ras_arch_push, .ras_arch_push_addr, .ras_arch_pop,
         .btb_inval, .btb_inval_pc, .dec_ras_push, .dec_ras_push_addr,
         .fq_v, .fq_hw, .fq_pc, .fq_exc, .fq_pt, .fq_ptgt, .fq_pop,
-        .satp, .priv, .itlb_flush(tlb_flush_all), .icache_inval,
+        .satp, .priv, .sf_valid(sfence_commit), .sf_va(sf_va), .sf_vpn(sf_vpn), .sf_asid(sf_asid), .sf_asid_val(sf_asid_val), .icache_inval, .pmpcfg, .pmp_lo, .pmp_hi, .pmp_any_locked,
         .ptw_req(ptw_req_i), .ptw_vpn(ptw_vpn_i), .ptw_gnt(!ptw_busy && !ptw_req_d),
-        .ptw_resp_valid, .ptw_resp_for_d, .ptw_resp_vpn, .ptw_resp_page_fault,
+        .ptw_resp_valid, .ptw_resp_for_d, .ptw_resp_vpn, .ptw_resp_asid, .ptw_resp_page_fault,
         .ptw_resp_access_fault, .ptw_resp_insert, .ptw_resp_ppn, .ptw_resp_level, .ptw_resp_flags,
         .imem_req, .imem_addr, .imem_ack, .imem_data, .imem_error
     );
@@ -330,10 +344,59 @@ module nebula_core_full #(
         end
     endtask
 
+    // triggers de execução: por parcela de 16 bits (endereço antes do fetch,
+    // dado depois), na mesma ordem do Spike
+    always_comb begin
+        any_ex_trig = 1'b0;
+        for (int i = 0; i < NTRIG; i++) if (trig[i].valid && trig[i].ex) any_ex_trig = 1'b1;
+    end
+
+    function automatic uop_t exec_trig(input uop_t u, input logic is32, input logic [15:0] h0,
+                                       input logic [15:0] h1, input logic [63:0] pc,
+                                       input logic f0, input logic f1);
+        uop_t      r;
+        trig_res_t a;
+        logic      bp;
+        logic [63:0] bpa;
+        logic [NTRIG-1:0][1:0] hits;
+        r = u; bp = 1'b0; bpa = pc; hits = '0;
+        a = trig_check(trig, 2'd0, pc, 4'd2, 1'b0, 64'd0, priv, st_mie, st_sie, deleg_bp);
+        hits = hits | a.hit;
+        if (a.fire) bp = 1'b1;
+        else if (!f0) begin
+            a = trig_check(trig, 2'd0, pc, 4'd2, 1'b1, {48'b0, h0}, priv, st_mie, st_sie, deleg_bp);
+            hits = hits | a.hit;
+            if (a.fire) bp = 1'b1;
+            else if (is32) begin
+                a = trig_check(trig, 2'd0, pc + 64'd2, 4'd2, 1'b0, 64'd0, priv, st_mie, st_sie, deleg_bp);
+                hits = hits | a.hit;
+                if (a.fire) begin bp = 1'b1; bpa = pc + 64'd2; end
+                else if (!f1) begin
+                    a = trig_check(trig, 2'd0, pc + 64'd2, 4'd2, 1'b1, {48'b0, h1}, priv, st_mie, st_sie, deleg_bp);
+                    hits = hits | a.hit;
+                    if (a.fire) begin bp = 1'b1; bpa = pc + 64'd2; end
+                end
+            end
+        end
+        r.trig_hit = hits;
+        if (bp) begin
+            r.fu = FU_NONE; r.exc = 1'b1; r.exc_cause = EXC_BREAKPOINT; r.exc_tval = bpa;
+            r.rd_en = 1'b0; r.rs1_en = 1'b0; r.rs2_en = 1'b0; r.rs3_en = 1'b0;
+            r.serial = 1'b0; r.pred_taken = 1'b0;
+        end
+        return r;
+    endfunction
+
     always_comb begin
         uop_t t0, t1;
         t0 = fix_uop(d0_raw, i0_fexc, i0_fexc2, i0_fcode, i0_ftval, i0_pt, i0_ptgt);
         t1 = fix_uop(d1_raw, i1_fexc, i1_fexc2, i1_fcode, i1_ftval, i1_pt, i1_ptgt);
+        t0.trig_hit = '0;
+        t1.trig_hit = '0;
+        if (any_ex_trig) begin
+            t0 = exec_trig(t0, i0_is32 && !i0_fexc, fq_hw[0], fq_hw[1], fq_pc[0], i0_fexc, i0_fexc2);
+            t1 = exec_trig(t1, i1_is32 && !i1_fexc, fq_hw[i1_k], fq_hw[i1_k+1], i1_pc, i1_fexc, i1_fexc2);
+        end
         dec_fix(t0, i0_len, d0, d0_redir, d0_redir_pc, d0_btbinv, d0_raspush);
         dec_fix(t1, i1_len, d1, d1_redir, d1_redir_pc, d1_btbinv, d1_raspush);
     end
@@ -377,26 +440,58 @@ module nebula_core_full #(
 
     logic [1:0]       wb_v;
     uop_t             wb_u   [2];
-    logic [1:0][63:0] wb_res;
+    logic [1:0][63:0] wb_res, wb_b, wb_res_vaddr;
     logic [1:0]       wb_exc;
     logic [1:0][4:0]  wb_cause;
     logic [1:0][63:0] wb_tval;
-    logic [1:0]       wb_replay, wb_side, wb_mmio;
+    logic [1:0]       wb_replay, wb_side, wb_mmio, wb_bp_after;
+    logic [1:0][NTRIG-1:0][1:0] wb_trig_hit;
     logic [1:0][4:0]  wb_flags;
 
     // =====================================================================
     // ISSUE
     // =====================================================================
-    function automatic logic src_match(input logic en, input logic [4:0] idx, input logic fp,
-                                       input logic pv, input uop_t p);
-        return en && pv && p.rd_en && (p.rd == idx) && (p.rd_fp == fp) && (fp || idx != 5'd0);
+    // visões compactas de fontes/destino (evita copiar uop_t inteiro em funções)
+    typedef struct packed {
+        logic [4:0] rs1, rs2, rs3;
+        logic       rs1_en, rs2_en, rs3_en, rs1_fp, rs2_fp;
+    } srcs_t;
+    typedef struct packed {
+        logic       en;
+        logic [4:0] rd;
+        logic       fp;
+    } dst_t;
+
+    function automatic srcs_t srcs_of(input uop_t u);
+        return '{rs1: u.rs1, rs2: u.rs2, rs3: u.rs3, rs1_en: u.rs1_en, rs2_en: u.rs2_en,
+                 rs3_en: u.rs3_en, rs1_fp: u.rs1_fp, rs2_fp: u.rs2_fp};
+    endfunction
+    function automatic dst_t dst_of(input uop_t u);
+        return '{en: u.rd_en, rd: u.rd, fp: u.rd_fp};
     endfunction
 
-    function automatic logic uses_reg(input uop_t c, input logic pv, input uop_t p);
+    function automatic logic src_match(input logic en, input logic [4:0] idx, input logic fp,
+                                       input logic pv, input dst_t p);
+        return en && pv && p.en && (p.rd == idx) && (p.fp == fp) && (fp || idx != 5'd0);
+    endfunction
+
+    function automatic logic uses_reg(input srcs_t c, input logic pv, input dst_t p);
         return src_match(c.rs1_en, c.rs1, c.rs1_fp, pv, p) ||
                src_match(c.rs2_en, c.rs2, c.rs2_fp, pv, p) ||
                src_match(c.rs3_en, c.rs3, 1'b1,     pv, p);
     endfunction
+
+    srcs_t d0_src, d1_src;
+    dst_t  d0_dst, ex_dst0, ex_dst1, mem_dst0, mem_dst1, wb_dst0, wb_dst1;
+    logic  ex_late0, ex_late1;
+    always_comb begin
+        d0_src   = srcs_of(d0);  d1_src = srcs_of(d1);  d0_dst = dst_of(d0);
+        ex_dst0  = dst_of(ex_u[0]);  ex_dst1  = dst_of(ex_u[1]);
+        mem_dst0 = dst_of(mem_u[0]); mem_dst1 = dst_of(mem_u[1]);
+        wb_dst0  = dst_of(wb_u[0]);  wb_dst1  = dst_of(wb_u[1]);
+        ex_late0 = ex_v[0] && ((ex_u[0].fu == FU_LOAD) || (ex_u[0].fu == FU_AMO) || (ex_u[0].fu == FU_MUL));
+        ex_late1 = ex_v[1] && ((ex_u[1].fu == FU_LOAD) || (ex_u[1].fu == FU_AMO) || (ex_u[1].fu == FU_MUL));
+    end
 
     function automatic logic is_late(input uop_t p);
         return (p.fu == FU_LOAD) || (p.fu == FU_AMO) || (p.fu == FU_MUL);
@@ -415,16 +510,14 @@ module nebula_core_full #(
     logic haz0, haz1, pair_ok, issue0, issue1, d_can;
 
     always_comb begin
-        haz0 = (ex_v[0] && is_late(ex_u[0]) && uses_reg(d0, 1'b1, ex_u[0])) ||
-               (ex_v[1] && is_late(ex_u[1]) && uses_reg(d0, 1'b1, ex_u[1]));
-        haz1 = (ex_v[0] && is_late(ex_u[0]) && uses_reg(d1, 1'b1, ex_u[0])) ||
-               (ex_v[1] && is_late(ex_u[1]) && uses_reg(d1, 1'b1, ex_u[1]));
+        haz0 = uses_reg(d0_src, ex_late0, ex_dst0) || uses_reg(d0_src, ex_late1, ex_dst1);
+        haz1 = uses_reg(d1_src, ex_late0, ex_dst0) || uses_reg(d1_src, ex_late1, ex_dst1);
 
         pair_ok = !alone(d0) && !alone(d1) &&
                   !(is_mem(d0) && is_mem(d1)) &&
                   !(is_cf(d0) && is_cf(d1)) &&
                   !(d0.fu == FU_MUL && d1.fu == FU_MUL) &&
-                  !uses_reg(d1, 1'b1, d0) &&
+                  !uses_reg(d1_src, 1'b1, d0_dst) &&
                   !(d0.rd_en && d1.rd_en && d0.rd == d1.rd && d0.rd_fp == d1.rd_fp) &&
                   !d0_redir && !i1_alias;
 
@@ -478,10 +571,10 @@ module nebula_core_full #(
         logic [63:0] v;
         v = dflt;
         if (en && (fp || idx != 5'd0)) begin
-            if      (src_match(1'b1, idx, fp, mem_v[1], mem_u[1])) v = mem_res[1];
-            else if (src_match(1'b1, idx, fp, mem_v[0], mem_u[0])) v = mem_res[0];
-            else if (src_match(1'b1, idx, fp, wb_v[1],  wb_u[1]))  v = wb_res[1];
-            else if (src_match(1'b1, idx, fp, wb_v[0],  wb_u[0]))  v = wb_res[0];
+            if      (src_match(1'b1, idx, fp, mem_v[1], mem_dst1)) v = mem_res[1];
+            else if (src_match(1'b1, idx, fp, mem_v[0], mem_dst0)) v = mem_res[0];
+            else if (src_match(1'b1, idx, fp, wb_v[1],  wb_dst1))  v = wb_res[1];
+            else if (src_match(1'b1, idx, fp, wb_v[0],  wb_dst0))  v = wb_res[0];
         end
         return v;
     endfunction
@@ -562,6 +655,7 @@ module nebula_core_full #(
                 FU_JAL, FU_JALR:            ex_res[s] = br_seq[s];
                 FU_LOAD, FU_STORE, FU_AMO:  ex_res[s] = fa[s] + ex_u[s].imm;
                 FU_CSR:                     ex_res[s] = ex_u[s].funct3[2] ? ex_u[s].imm : fa[s];
+                FU_SYS:                     ex_res[s] = fa[s];
                 default:                    ex_res[s] = alu(ex_u[s].alu_op, ex_u[s].word, opa, opb);
             endcase
         end
@@ -656,7 +750,8 @@ module nebula_core_full #(
     logic        lsu_valid;
     logic        ms;            // slot com a operação de memória
     logic        side_ok;
-    logic        lsu_side, lsu_mmio;
+    logic        lsu_side, lsu_mmio, lsu_bp_after;
+    logic [NTRIG-1:0][1:0] lsu_trig_hit;
 
     always_comb begin
         ms        = !(mem_v[0] && is_mem(mem_u[0]));
@@ -665,7 +760,7 @@ module nebula_core_full #(
 
     assign side_ok = !wb_flush && !irq_pending && !wb_hold;
 
-    nebula_lsu u_lsu (
+    nebula_lsu #(.PMA_BASE(PMA_BASE), .PMA_SIZE(PMA_SIZE), .PMA_ATTR(PMA_ATTR)) u_lsu (
         .clk, .rst_n,
         .req_valid(lsu_valid), .req_new(1'b0), .req_fu(mem_u[ms].fu),
         .req_size(mem_u[ms].funct3), .req_fp(mem_u[ms].mem_fp), .req_amo_op(mem_u[ms].amo_op),
@@ -673,12 +768,17 @@ module nebula_core_full #(
         .side_ok, .kill(wb_flush),
         .done(lsu_done), .result(lsu_result), .exc(lsu_exc), .exc_cause(lsu_cause),
         .exc_tval(lsu_tval), .replay(lsu_replay), .side_effect(lsu_side), .mmio(lsu_mmio),
-        .satp, .priv, .mprv, .mpp, .sum, .mxr, .tlb_flush(tlb_flush_all),
+        .bp_after(lsu_bp_after), .trig_hit(lsu_trig_hit), .trig,
+        .trig_mie(st_mie), .trig_sie(st_sie), .trig_deleg(deleg_bp),
+        .satp, .priv, .mprv, .mpp, .sum, .mxr, .sf_valid(sfence_commit), .sf_va(sf_va), .sf_vpn(sf_vpn), .sf_asid(sf_asid), .sf_asid_val(sf_asid_val), .pmpcfg, .pmp_lo, .pmp_hi, .pmp_any_locked,
         .ptw_req(ptw_req_d), .ptw_vpn(ptw_vpn_d), .ptw_gnt(!ptw_busy),
-        .ptw_resp_valid, .ptw_resp_for_d, .ptw_resp_vpn, .ptw_resp_page_fault,
+        .ptw_resp_valid, .ptw_resp_for_d, .ptw_resp_vpn, .ptw_resp_asid, .ptw_resp_page_fault,
         .ptw_resp_access_fault, .ptw_resp_insert, .ptw_resp_ppn, .ptw_resp_level, .ptw_resp_flags,
         .sb_empty,
+        .snoop_inv_valid(snoop_req_in.valid && snoop_req_in.op == COH_INVALIDATE),
+        .snoop_inv_line(snoop_req_in.addr[55:6]),
         .dmem_req, .dmem_we, .dmem_addr, .dmem_wdata, .dmem_wstrb, .dmem_uncached,
+        .dmem_is_amo, .dmem_amo_op,
         .dmem_ack, .dmem_rdata, .dmem_error
     );
 
@@ -722,9 +822,11 @@ module nebula_core_full #(
     logic        replay_flush;
     logic [63:0] replay_pc;
     logic [63:0] nxt;
+    logic        exc_slot0, exc_slot1;
 
     always_comb begin
         trap_valid = 1'b0; trap_intr = 1'b0; trap_cause = '0; trap_epc = '0; trap_tval = '0;
+        exc_slot0 = 1'b0; exc_slot1 = 1'b0;
         do_mret = 1'b0; do_sret = 1'b0;
         commit = 2'b00;
         csr_commit = 1'b0;
@@ -742,12 +844,14 @@ module nebula_core_full #(
                 trap_valid = 1'b1; trap_intr = 1'b1; trap_cause = irq_cause;
                 trap_epc = wb_u[0].pc; trap_tval = '0;
             end else if (wb_exc[0]) begin
+                exc_slot0 = 1'b1;
                 trap_valid = 1'b1; trap_cause = wb_cause[0];
                 trap_epc = wb_u[0].pc; trap_tval = wb_tval[0];
             end else if (wb_replay[0]) begin
                 replay_flush = 1'b1; replay_pc = wb_u[0].pc;
             end else if (wb_u[0].fu == FU_CSR) begin
                 if (csr_illegal) begin
+                    exc_slot0 = 1'b1;
                     trap_valid = 1'b1; trap_cause = EXC_ILLEGAL_INSTR;
                     trap_epc = wb_u[0].pc; trap_tval = {32'b0, wb_u[0].instr};
                 end else begin
@@ -773,7 +877,10 @@ module nebula_core_full #(
                         commit[0] = 1'b1; sfence_commit = 1'b1;
                         serial_flush = 1'b1; serial_pc = nxt;
                     end
-                    default: commit[0] = 1'b1; // FENCE
+                    default: begin   // FENCE: ordena acessos -> drena o store buffer
+                        if (!sb_empty) wb_hold = 1'b1;
+                        else commit[0] = 1'b1;
+                    end
                 endcase
             end else begin
                 commit[0] = 1'b1;
@@ -785,6 +892,7 @@ module nebula_core_full #(
                     trap_valid = 1'b1; trap_intr = 1'b1; trap_cause = irq_cause;
                     trap_epc = wb_u[1].pc; trap_tval = '0;
                 end else if (wb_exc[1]) begin
+                    exc_slot1 = 1'b1;
                     trap_valid = 1'b1; trap_cause = wb_cause[1];
                     trap_epc = wb_u[1].pc; trap_tval = wb_tval[1];
                 end else if (wb_replay[1]) begin
@@ -795,13 +903,43 @@ module nebula_core_full #(
             end
         end
 
+        // trigger com temporização "após": a instrução efetiva e o trap ocorre na seguinte
+        if (!trap_valid) begin
+            if (commit[0] && wb_bp_after[0]) begin
+                commit[1]  = 1'b0;
+                trap_valid = 1'b1; trap_intr = 1'b0; trap_cause = EXC_BREAKPOINT;
+                trap_epc   = nxt; trap_tval = wb_res_vaddr[0];
+                serial_flush = 1'b0;
+            end else if (commit[1] && wb_bp_after[1]) begin
+                trap_valid = 1'b1; trap_intr = 1'b0; trap_cause = EXC_BREAKPOINT;
+                trap_epc   = wb_u[1].pc + (wb_u[1].is_rvc ? 64'd2 : 64'd4);
+                trap_tval  = wb_res_vaddr[1];
+            end
+        end
+
+        // hits de triggers: aplicados quando a instrução efetiva ou gera exceção
+        trig_hit_we  = 1'b0;
+        trig_hit_val = '0;
+        if (commit[0] || exc_slot0) begin
+            trig_hit_we = 1'b1; trig_hit_val = trig_hit_val | wb_trig_hit[0];
+        end
+        if (commit[1] || exc_slot1) begin
+            trig_hit_we = 1'b1; trig_hit_val = trig_hit_val | wb_trig_hit[1];
+        end
+
         wb_flush = trap_valid || serial_flush || replay_flush || do_mret || do_sret;
         wb_redirect_pc = trap_valid ? trap_target :
                          (do_mret || do_sret) ? xret_target :
                          serial_flush ? serial_pc : replay_pc;
     end
 
+    // PTW: descarta walks em andamento em SFENCE.VMA ou troca de satp
     assign tlb_flush_all = sfence_commit || csr_tlb_flush;
+    // operandos do SFENCE.VMA: rs1 (VA) em wb_res, rs2 (ASID) em wb_b
+    assign sf_va       = wb_u[0].instr[19:15] != 5'd0;
+    assign sf_vpn      = wb_res[0][38:12];
+    assign sf_asid     = wb_u[0].instr[24:20] != 5'd0;
+    assign sf_asid_val = wb_b[0][15:0];
     assign icache_inval  = fencei_commit;
 
     // escrita nos registradores
@@ -832,6 +970,8 @@ module nebula_core_full #(
         .irq_seip(s_external_irq), .mtime,
         .irq_pending, .irq_cause, .wfi_wake,
         .priv, .satp, .mprv, .mpp, .sum, .mxr, .tvm, .tw, .tsr, .fs, .frm,
+        .pmpcfg, .pmpaddr, .pmp_lo, .pmp_hi, .pmp_any_locked,
+        .trig, .mie_out(st_mie), .sie_out(st_sie), .deleg_bp, .trig_hit_we, .trig_hit_val,
         .tlb_flush(csr_tlb_flush)
     );
 
@@ -855,8 +995,9 @@ module nebula_core_full #(
             end
             ex_a <= '0; ex_b <= '0; ex_c <= '0;
             mem_res <= '0; mem_a <= '0; mem_b <= '0; mem_flags <= '0;
-            wb_res <= '0; wb_exc <= '0; wb_cause <= '0; wb_tval <= '0;
+            wb_res <= '0; wb_b <= '0; wb_res_vaddr <= '0; wb_exc <= '0; wb_cause <= '0; wb_tval <= '0;
             wb_replay <= '0; wb_side <= '0; wb_mmio <= '0; wb_flags <= '0;
+            wb_bp_after <= '0; wb_trig_hit <= '0;
         end else begin
             // ---------------- MEM -> WB ----------------
             if (wb_flush || !mem_adv) begin
@@ -868,12 +1009,16 @@ module nebula_core_full #(
                     wb_v[s]      <= mem_v[s];
                     wb_u[s]      <= mem_u[s];
                     wb_flags[s]  <= mem_flags[s];
+                    wb_b[s]      <= mem_b[s];
+                    wb_res_vaddr[s] <= mem_res[s];
                     wb_exc[s]    <= mem_u[s].exc || (is_ls && lsu_exc);
                     wb_cause[s]  <= mem_u[s].exc ? mem_u[s].exc_cause : lsu_cause;
                     wb_tval[s]   <= mem_u[s].exc ? mem_u[s].exc_tval  : lsu_tval;
                     wb_replay[s] <= is_ls && lsu_replay;
                     wb_side[s]   <= is_ls && lsu_side;
                     wb_mmio[s]   <= is_ls && lsu_mmio;
+                    wb_bp_after[s] <= is_ls && lsu_bp_after && !lsu_exc;
+                    wb_trig_hit[s] <= mem_u[s].trig_hit | (is_ls ? lsu_trig_hit : '0);
                     if (is_ls)                     wb_res[s] <= lsu_result;
                     else if (mem_u[s].fu == FU_MUL) wb_res[s] <= mul_res[s];
                     else                           wb_res[s] <= mem_res[s];

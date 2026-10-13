@@ -1,6 +1,8 @@
 `timescale 1ns/1ps
 `default_nettype none
 
+import nebula_pkg::*;
+
 /**
  * @module nebula_fetch
  * @brief Frontend do Nebula Core: geração de PC, predição (BTB + RAS),
@@ -16,6 +18,9 @@
  *   entrada marcada; o fetch para até o próximo redirecionamento.
  */
 module nebula_fetch #(
+    parameter logic [PMA_N-1:0][55:0] PMA_BASE = PMA_DEF_BASE,
+    parameter logic [PMA_N-1:0][55:0] PMA_SIZE = PMA_DEF_SIZE,
+    parameter logic [PMA_N-1:0][2:0]  PMA_ATTR = PMA_DEF_ATTR,
     parameter int BTB_SETS  = 1024,
     parameter int RAS_DEPTH = 8,
     parameter int FQ_DEPTH  = 16
@@ -58,8 +63,16 @@ module nebula_fetch #(
     // estado MMU
     input  wire  [63:0]  satp,
     input  wire  [1:0]   priv,
-    input  wire          itlb_flush,
+    input  wire          sf_valid,       // SFENCE.VMA
+    input  wire          sf_va,
+    input  wire  [26:0]  sf_vpn,
+    input  wire          sf_asid,
+    input  wire  [15:0]  sf_asid_val,
     input  wire          icache_inval,
+    input  wire  [15:0][7:0]  pmpcfg,
+    input  wire  [15:0][57:0] pmp_lo,
+    input  wire  [15:0][57:0] pmp_hi,
+    input  wire               pmp_any_locked,
 
     // PTW
     output logic         ptw_req,
@@ -68,6 +81,7 @@ module nebula_fetch #(
     input  wire          ptw_resp_valid,
     input  wire          ptw_resp_for_d,
     input  wire  [26:0]  ptw_resp_vpn,
+    input  wire  [15:0]  ptw_resp_asid,
     input  wire          ptw_resp_page_fault,
     input  wire          ptw_resp_access_fault,
     input  wire          ptw_resp_insert,
@@ -98,6 +112,7 @@ module nebula_fetch #(
 
     logic [63:0] fpc;
     logic        booted;
+    logic        walk_stale;   // redirecionado durante o walk: resultado não vale para o fpc atual
 
     // =====================================================================
     // FQ
@@ -136,16 +151,22 @@ module nebula_fetch #(
     nebula_tlb #(.ENTRIES(16)) u_itlb (
         .clk, .rst_n,
         .lookup_vpn   (fpc[38:12]),
+        .lookup_asid  (satp[59:44]),
         .lookup_hit   (itlb_hit),
         .lookup_ppn   (itlb_ppn),
         .lookup_flags (itlb_flags),
         .lookup_idx   (itlb_idx),
-        .insert_valid (ptw_resp_valid && !ptw_resp_for_d && ptw_resp_insert && !itlb_flush),
+        .insert_valid (ptw_resp_valid && !ptw_resp_for_d && ptw_resp_insert && !sf_valid),
+        .insert_asid  (ptw_resp_asid),
         .insert_vpn   (ptw_resp_vpn),
         .insert_ppn   (ptw_resp_ppn),
         .insert_level (ptw_resp_level),
         .insert_flags (ptw_resp_flags),
-        .flush_all    (itlb_flush),
+        .flush        (sf_valid),
+        .flush_va     (sf_va),
+        .flush_vpn    (sf_vpn),
+        .flush_asid   (sf_asid),
+        .flush_asid_val(sf_asid_val),
         .inval_valid  (state == F_RUN && vm && itlb_hit && itlb_perm_fault && !redirect),
         .inval_idx    (itlb_idx)
     );
@@ -159,6 +180,7 @@ module nebula_fetch #(
     logic        f_exc;
     logic [1:0]  f_exc_code;
     logic        f_need_walk;
+    logic        f_pma_ok, f_pma_x;
 
     always_comb begin
         noncanon    = fpc[63:39] != {25{fpc[38]}};
@@ -178,7 +200,22 @@ module nebula_fetch #(
         end else if (fpc[63:56] != 8'd0) begin
             f_exc = 1'b1; f_exc_code = 2'd2;
         end
+        // PMA/PMP: região inexistente, não executável ou negada
+        if (!f_exc && !f_need_walk && !(f_pma_ok && f_pma_x && sec_ok[fpc[3:2]])) begin
+            f_exc = 1'b1; f_exc_code = 2'd2;
+        end
     end
+
+    // PMP por setor de 4 bytes do bloco de 16 B
+    logic [3:0] sec_ok;
+    for (genvar g = 0; g < 4; g++) begin : g_pmp
+        nebula_pmp u_pmp (.cfg(pmpcfg), .lo(pmp_lo), .hi(pmp_hi), .any_locked(pmp_any_locked), .addr({fetch_ppn, fpc[11:4], 2'(g), 2'b00}),
+                          .use_lo(g % 2 == 0), .use_hi(g % 2 == 1), .acc(2'd2), .priv(priv), .ok(sec_ok[g]));
+    end
+
+    nebula_pma #(.N(PMA_N), .BASE(PMA_BASE), .SIZE(PMA_SIZE), .ATTR(PMA_ATTR)) u_pma (
+        .addr({fetch_ppn, fpc[11:0]}), .ok(f_pma_ok), .cacheable(), .exec(f_pma_x)
+    );
 
     // =====================================================================
     // I-Cache
@@ -207,7 +244,7 @@ module nebula_fetch #(
     // =====================================================================
     // BTB
     // =====================================================================
-    logic            btb_v   [BTB_SETS];
+    logic [BTB_SETS-1:0] btb_v;
     logic [TAGW-1:0] btb_tag [BTB_SETS];
     logic [2:0]      btb_off [BTB_SETS];
     logic [2:0]      btb_typ [BTB_SETS];
@@ -220,6 +257,9 @@ module nebula_fetch #(
     logic            b_hit, b_taken;
     logic [63:0]     b_target;
     logic [2:0]      end_off;
+    logic [2:0]      pmp_lim;
+    logic            pmp_trunc;
+    logic [63:0]     seq_next;
 
     // RAS especulativo
     logic [63:0] ras      [RAS_DEPTH];
@@ -232,10 +272,20 @@ module nebula_fetch #(
         b_tag     = fpc[38 -: TAGW];
         start_off = fpc[3:1];
         b_hit     = btb_v[b_idx] && (btb_tag[b_idx] == b_tag) && (btb_off[b_idx] >= start_off);
-        b_taken   = b_hit && ((btb_typ[b_idx] != BT_COND) || btb_ctr[b_idx][1]);
+        // limite imposto pelo PMP: o bloco termina antes do primeiro setor negado
+        pmp_lim   = 3'd7;
+        pmp_trunc = 1'b0;
+        for (int sct = 3; sct >= 1; sct--)
+            if (2'(sct) > fpc[3:2] && !sec_ok[sct]) begin
+                pmp_lim   = 3'(2 * sct - 1);
+                pmp_trunc = 1'b1;
+            end
+        b_taken   = b_hit && ((btb_typ[b_idx] != BT_COND) || btb_ctr[b_idx][1]) &&
+                    (btb_off[b_idx] <= pmp_lim);
         b_target  = (btb_typ[b_idx] == BT_RET) ? ras[ras_ptr]
                                                : {{25{btb_tgt[b_idx][38]}}, btb_tgt[b_idx]};
-        end_off   = b_taken ? btb_off[b_idx] : 3'd7;
+        end_off   = b_taken ? btb_off[b_idx] : pmp_lim;
+        seq_next  = pmp_trunc ? {fpc[63:4], pmp_lim + 3'd1, 1'b0} : {fpc[63:4] + 60'd1, 4'b0};
     end
 
     // =====================================================================
@@ -259,7 +309,7 @@ module nebula_fetch #(
         if (!redirect && q_count < (QW+1)'(FQ_DEPTH)) begin
             if (state == F_RUN && f_exc) begin
                 exc_push = 1'b1; exc_push_code = f_exc_code;
-            end else if (state == F_PTW && ptw_resp_valid && !ptw_resp_for_d &&
+            end else if (state == F_PTW && ptw_resp_valid && !ptw_resp_for_d && !walk_stale &&
                          (ptw_resp_page_fault || ptw_resp_access_fault) &&
                          ptw_resp_vpn == fpc[38:12]) begin
                 exc_push = 1'b1; exc_push_code = ptw_resp_page_fault ? 2'd1 : 2'd2;
@@ -284,6 +334,7 @@ module nebula_fetch #(
             state             <= F_HALT;
             fpc               <= '0;
             booted            <= 1'b0;
+            walk_stale        <= 1'b0;
             q_head            <= '0;
             q_tail            <= '0;
             q_count           <= '0;
@@ -292,7 +343,7 @@ module nebula_fetch #(
             refill_redirected <= 1'b0;
             ras_ptr           <= '0;
             ras_arch_ptr      <= '0;
-            for (int i = 0; i < BTB_SETS; i++) btb_v[i] <= 1'b0;
+            btb_v <= '0;
             for (int i = 0; i < RAS_DEPTH; i++) begin
                 ras[i]      <= '0;
                 ras_arch[i] <= '0;
@@ -404,18 +455,24 @@ module nebula_fetch #(
                     end else if (f_exc) begin
                         if (do_push_exc) state <= F_HALT;
                     end else if (f_need_walk) begin
-                        if (ptw_gnt) state <= F_PTW;
+                        if (ptw_gnt) begin
+                            state      <= F_PTW;
+                            walk_stale <= 1'b0;
+                        end
                     end else if (!ic_hit) begin
                         state             <= F_REFILL;
                         refill_paddr      <= {fetch_ppn, fpc[11:0]};
                         refill_discard    <= 1'b0;
                         refill_redirected <= 1'b0;
                     end else if (do_push_block) begin
-                        fpc <= b_taken ? b_target : {fpc[63:4] + 60'd1, 4'b0};
+                        fpc <= b_taken ? b_target : seq_next;
                     end
                 end
                 F_PTW: begin
-                    if (redirect) fpc <= redirect_pc;
+                    if (redirect) begin
+                        fpc        <= redirect_pc;
+                        walk_stale <= 1'b1;
+                    end
                     if (ptw_resp_valid && !ptw_resp_for_d) begin
                         state <= do_push_exc ? F_HALT : F_RUN;
                     end

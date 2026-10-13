@@ -5,10 +5,17 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 IMG=${IMG:-/opt/riscv/buildroot/output/images}
-SIM=$ROOT/build/sim/Vnebula_core_full
-for a in "$@"; do [ "$a" = "--cosim" ] && SIM=$ROOT/build/sim_cosim/Vnebula_core_full; done
+NCORES=${NCORES:-1}
+if [ "$NCORES" = "1" ]; then
+    SIM=$ROOT/build/sim/Vnebula_cluster
+    DTB=$HERE/nebula_sim.dtb
+else
+    SIM=$ROOT/build/sim_smp$NCORES/Vnebula_cluster
+    DTB=$HERE/nebula_sim_smp$NCORES.dtb
+fi
+for a in "$@"; do [ "$a" = "--cosim" ] && SIM=${COSIM_SIM:-$ROOT/build/sim_cosim/Vnebula_cluster}; done
 exec "$SIM" --boot-rom --ram-mb=256 \
      --load=$IMG/fw_jump.bin@0x80000000 \
-     --load=$IMG/Image@0x80200000 \
-     --dtb=$HERE/nebula_sim.dtb@0x82200000 \
+     --load=${KERNEL:-$IMG/Image}@0x80200000 \
+     --dtb=$DTB@0x82200000 \
      --mtime-div=100 --stall-limit=1000000000 --max-cycles=${MAX_CYCLES:-4000000000} "$@"

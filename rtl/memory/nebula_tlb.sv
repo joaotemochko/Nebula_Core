@@ -3,13 +3,15 @@
 
 /**
  * @module nebula_tlb
- * @brief TLB Sv39 totalmente associativa com suporte a superpáginas (2M/1G).
+ * @brief TLB Sv39 totalmente associativa com superpáginas (2M/1G) e ASIDs.
  *
- * Lookup combinacional. Somente PTEs folha válidas são inseridas (o PTW
- * nunca insere traduções que causariam page fault por PTE inválida).
- * A checagem de permissões (R/W/X/U/A/D, SUM, MXR) é feita pelo usuário.
- * ASIDs não são implementados (satp.ASID é somente-leitura zero), portanto
- * a TLB é inteiramente descartada em SFENCE.VMA / escrita de satp.
+ * Lookup combinacional: casa VPN (conforme o nível) e (G=1 ou ASID igual).
+ * Somente PTEs folha válidas são inseridas. A checagem de permissões
+ * (R/W/X/U/A/D, SUM, MXR) é feita pelo usuário.
+ *
+ * SFENCE.VMA seletivo:
+ *   flush_va  : invalida entradas que traduzem o VPN dado
+ *   flush_asid: restringe à ASID dada e preserva entradas globais
  */
 module nebula_tlb #(
     parameter int ENTRIES = 16
@@ -19,6 +21,7 @@ module nebula_tlb #(
 
     // lookup
     input  wire  [26:0]  lookup_vpn,
+    input  wire  [15:0]  lookup_asid,
     output logic         lookup_hit,
     output logic [43:0]  lookup_ppn,     // PPN já combinado para superpáginas
     output logic [7:0]   lookup_flags,   // D A G U X W R V
@@ -27,12 +30,17 @@ module nebula_tlb #(
     // inserção (resposta do PTW)
     input  wire          insert_valid,
     input  wire  [26:0]  insert_vpn,
+    input  wire  [15:0]  insert_asid,
     input  wire  [43:0]  insert_ppn,
     input  wire  [1:0]   insert_level,   // 0=4K 1=2M 2=1G
     input  wire  [7:0]   insert_flags,
 
     // invalidação
-    input  wire          flush_all,
+    input  wire          flush,          // SFENCE.VMA (seletivo conforme abaixo)
+    input  wire          flush_va,       // rs1 != x0
+    input  wire  [26:0]  flush_vpn,
+    input  wire          flush_asid,     // rs2 != x0
+    input  wire  [15:0]  flush_asid_val,
     input  wire          inval_valid,    // invalida a entrada que gerou fault
     input  wire  [$clog2(ENTRIES)-1:0] inval_idx
 );
@@ -40,6 +48,7 @@ module nebula_tlb #(
 
     logic [ENTRIES-1:0] valid;
     logic [26:0]        vpn   [ENTRIES];
+    logic [15:0]        asid  [ENTRIES];
     logic [43:0]        ppn   [ENTRIES];
     logic [1:0]         level [ENTRIES];
     logic [7:0]         flags [ENTRIES];
@@ -59,7 +68,8 @@ module nebula_tlb #(
         lookup_flags = '0;
         lookup_idx   = '0;
         for (int i = 0; i < ENTRIES; i++) begin
-            if (valid[i] && match(lookup_vpn, vpn[i], level[i])) begin
+            if (valid[i] && match(lookup_vpn, vpn[i], level[i]) &&
+                (flags[i][5] || asid[i] == lookup_asid)) begin
                 lookup_hit   = 1'b1;
                 lookup_idx   = IW'(i);
                 lookup_flags = flags[i];
@@ -77,14 +87,20 @@ module nebula_tlb #(
             valid    <= '0;
             repl_ptr <= '0;
         end else begin
-            if (flush_all) begin
-                valid <= '0;
+            if (flush) begin
+                for (int i = 0; i < ENTRIES; i++) begin
+                    logic hit_va, hit_asid;
+                    hit_va   = !flush_va || match(flush_vpn, vpn[i], level[i]);
+                    hit_asid = !flush_asid || (!flags[i][5] && asid[i] == flush_asid_val);
+                    if (hit_va && hit_asid) valid[i] <= 1'b0;
+                end
             end else begin
                 if (inval_valid)
                     valid[inval_idx] <= 1'b0;
                 if (insert_valid) begin
                     valid[repl_ptr] <= 1'b1;
                     vpn[repl_ptr]   <= insert_vpn;
+                    asid[repl_ptr]  <= insert_asid;
                     ppn[repl_ptr]   <= insert_ppn;
                     level[repl_ptr] <= insert_level;
                     flags[repl_ptr] <= insert_flags;

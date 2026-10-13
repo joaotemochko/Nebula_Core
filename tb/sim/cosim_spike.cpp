@@ -58,30 +58,38 @@ public:
     std::ostringstream sout;
     FILE* devnull = nullptr;
     uint64_t steps = 0;
+    // Em traps de trigger o Spike continua o passo e já executa a 1ª instrução
+    // do handler; guardamos o efeito dela para comparar no próximo commit.
+    bool ahead = false;
+    reg_t ahead_pc = 0;
+    commit_log_reg_t ahead_log;
     std::map<unsigned, int> csr_sync_notes;
 
     SpikeCosim(const uint8_t* ram, uint64_t ram_size, const uint8_t* rom, uint64_t rom_size, uint64_t start_pc) {
         sim.ram.assign(ram, ram + ram_size);
         sim.rom.assign(rom, rom + rom_size);
-        sim.cfg.isa = "rv64imafdc_zicsr_zifencei_zicntr_zihpm";
+        sim.cfg.isa = "rv64imafdc_zicsr_zifencei_zicntr_zihpm_zicclsm";
         sim.cfg.priv = "MSU";
-        sim.cfg.pmpregions = 0;
-        sim.cfg.trigger_count = 0;
+        sim.cfg.pmpregions = 16;
+        sim.cfg.trigger_count = 4;
         sim.cfg.hartids = {0};
         devnull = fopen("/dev/null", "w");
         proc = new processor_t(sim.cfg.isa, sim.cfg.priv, &sim.cfg, &sim, 0, false, devnull, sout);
         sim.harts[0] = proc;
         proc->set_max_vaddr_bits(39);
-        proc->set_impl(IMPL_MMU_ASID, false);
         proc->reset();
         proc->enable_log_commits();
+        // Spike habilita a entrada PMP 0 (NAPOT RWX) no reset por compatibilidade;
+        // o RTL segue a especificação (A=0, L=0 no reset)
+        proc->put_csr(CSR_PMPCFG0, 0);
+        proc->put_csr(CSR_PMPADDR0, 0);
         proc->get_state()->pc = start_pc;
     }
     ~SpikeCosim() override { delete proc; if (devnull) fclose(devnull); }
 
     static bool volatile_csr(unsigned c) {
         return c == CSR_MCYCLE || c == CSR_CYCLE || c == CSR_TIME || c == CSR_MIP || c == CSR_SIP ||
-               (c >= 0xF11 && c <= 0xF15) || (c >= 0x3A0 && c <= 0x3EF) || (c >= 0x7A0 && c <= 0x7AF) ||
+               (c >= 0xF11 && c <= 0xF15) || c == 0x7A3 || c == 0x7A4 ||
                (c >= 0xB03 && c <= 0xB1F) || (c >= 0xC03 && c <= 0xC1F) || (c >= 0x323 && c <= 0x33F) ||
                c == CSR_MCOUNTINHIBIT || c == CSR_MENVCFG || c == CSR_SENVCFG || c == CSR_MISA ||
                c == CSR_MCONFIGPTR || c == CSR_MSECCFG;
@@ -96,6 +104,13 @@ public:
                 (unsigned long)s->mstatus->read(), (unsigned long)s->mcause->read(), (unsigned long)s->mepc->read(),
                 (unsigned long)s->mtval->read(), (unsigned long)s->scause->read(), (unsigned long)s->sepc->read(),
                 (unsigned long)proc->get_csr(CSR_SATP));
+        fprintf(stderr, "  Spike trig: tselect=%lx tdata1=%016lx tdata2=%016lx\n",
+                (unsigned long)proc->get_csr(CSR_TSELECT), (unsigned long)proc->get_csr(CSR_TDATA1),
+                (unsigned long)proc->get_csr(CSR_TDATA2));
+        fprintf(stderr, "  Spike PMP: cfg0=%016lx cfg2=%016lx\n", (unsigned long)proc->get_csr(CSR_PMPCFG0),
+                (unsigned long)proc->get_csr(CSR_PMPCFG2));
+        for (int i = 0; i < 16; i++)
+            fprintf(stderr, "    pmpaddr%-2d=%016lx%s", i, (unsigned long)proc->get_csr(CSR_PMPADDR0 + i), (i % 4 == 3) ? "\n" : "");
     }
 
     // executa um passo do Spike; retorna true se o Spike tomou trap
@@ -112,15 +127,21 @@ public:
     bool step(uint64_t pc, uint32_t insn, bool rd_en, bool rd_fp, unsigned rd, uint64_t rd_val,
               bool mmio, uint64_t cycle) override {
         state_t* s = proc->get_state();
-        if (s->pc != pc) { dump("PC divergente (commit)", pc, insn, cycle); return false; }
-        s->mip->backdoor_write_with_mask(EXT_MIP, 0);
         bool is_csr = ((insn & 0x7F) == 0x73) && (((insn >> 12) & 7) != 0);
         unsigned csr = insn >> 20;
-        bool trapped = spike_step();
-        bool minstret_write = is_csr && (csr == CSR_MINSTRET || csr == CSR_INSTRET);
-        if (trapped && !minstret_write) {
-            dump("Spike tomou trap, RTL efetivou a instrução", pc, insn, cycle);
-            return false;
+        if (ahead) {
+            ahead = false;
+            if (ahead_pc != pc) { dump("PC divergente (após trap de trigger)", pc, insn, cycle); return false; }
+            s->log_reg_write = ahead_log;
+        } else {
+            if (s->pc != pc) { dump("PC divergente (commit)", pc, insn, cycle); return false; }
+            s->mip->backdoor_write_with_mask(EXT_MIP, 0);
+            bool trapped = spike_step();
+            bool minstret_write = is_csr && (csr == CSR_MINSTRET || csr == CSR_INSTRET);
+            if (trapped && !minstret_write) {
+                dump("Spike tomou trap, RTL efetivou a instrução", pc, insn, cycle);
+                return false;
+            }
         }
         // registradores escritos pelo Spike
         for (auto& kv : s->log_reg_write) {
@@ -173,6 +194,17 @@ public:
         if (intr) s->mip->backdoor_write_with_mask(EXT_MIP, pins & EXT_MIP);
         bool trapped = spike_step();
         s->mip->backdoor_write_with_mask(EXT_MIP, 0);
+        if (!trapped && !intr && cause == 3) {
+            // trap de trigger: o Spike já executou a 1ª instrução do handler
+            bool m = s->prv == PRV_M;
+            if ((m ? s->mcause->read() : s->scause->read()) == 3 &&
+                (m ? s->mepc->read() : s->sepc->read()) == epc) {
+                ahead     = true;
+                ahead_pc  = (m ? s->mtvec->read() : s->stvec->read()) & ~(reg_t)3;
+                ahead_log = s->log_reg_write;
+                trapped   = true;
+            }
+        }
         if (!trapped) {
             dump(intr ? "RTL tomou interrupção, Spike não" : "RTL tomou exceção, Spike executou a instrução",
                  epc, 0, cycle);

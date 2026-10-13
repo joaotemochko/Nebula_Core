@@ -1,6 +1,8 @@
 `timescale 1ns/1ps
 `default_nettype none
 
+import nebula_pkg::*;
+
 /**
  * @module nebula_ptw
  * @brief Page Table Walker Sv39 compartilhado entre ITLB e DTLB.
@@ -12,13 +14,21 @@
  *   coerência com a D-Cache write-through.
  * - 'flush' durante um walk marca o resultado como descartável (não insere).
  */
-module nebula_ptw (
+module nebula_ptw #(
+    parameter logic [PMA_N-1:0][55:0] PMA_BASE = PMA_DEF_BASE,
+    parameter logic [PMA_N-1:0][55:0] PMA_SIZE = PMA_DEF_SIZE,
+    parameter logic [PMA_N-1:0][2:0]  PMA_ATTR = PMA_DEF_ATTR
+)(
     input  wire          clk,
     input  wire          rst_n,
 
     input  wire  [63:0]  satp,
     input  wire          sb_empty,
     input  wire          flush,
+    input  wire  [15:0][7:0]  pmpcfg,
+    input  wire  [15:0][57:0] pmp_lo,
+    input  wire  [15:0][57:0] pmp_hi,
+    input  wire               pmp_any_locked,
 
     input  wire          req_i,
     input  wire  [26:0]  vpn_i,
@@ -29,6 +39,7 @@ module nebula_ptw (
     output logic         resp_valid,
     output logic         resp_for_d,
     output logic [26:0]  resp_vpn,
+    output logic [15:0]  resp_asid,
     output logic         resp_page_fault,
     output logic         resp_access_fault,
     output logic         resp_insert,      // inserir na TLB correspondente
@@ -47,6 +58,7 @@ module nebula_ptw (
 
     logic [1:0]  level;
     logic [26:0] vpn;
+    logic [15:0] asid;
     logic        for_d;
     logic [55:0] pte_addr;
     logic        discard;
@@ -67,7 +79,14 @@ module nebula_ptw (
     end
 
     assign busy     = (state != P_IDLE);
-    assign mem_req  = (state == P_READ) && sb_empty;
+    logic pte_ok, pte_mem;
+    nebula_pma #(.N(PMA_N), .BASE(PMA_BASE), .SIZE(PMA_SIZE), .ATTR(PMA_ATTR)) u_pma (
+        .addr(pte_addr), .ok(pte_ok), .cacheable(pte_mem), .exec()
+    );
+    logic pte_pmp;
+    nebula_pmp u_pmp (.cfg(pmpcfg), .lo(pmp_lo), .hi(pmp_hi), .any_locked(pmp_any_locked), .addr(pte_addr), .use_lo(1'b1), .use_hi(1'b1),
+                      .acc(2'd0), .priv(2'b01), .ok(pte_pmp));
+    assign mem_req  = (state == P_READ) && sb_empty && pte_ok && pte_mem && pte_pmp;
     assign mem_addr = pte_addr;
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -82,6 +101,8 @@ module nebula_ptw (
             resp_valid        <= 1'b0;
             resp_for_d        <= 1'b0;
             resp_vpn          <= '0;
+            resp_asid         <= '0;
+            asid              <= '0;
             resp_page_fault   <= 1'b0;
             resp_access_fault <= 1'b0;
             resp_insert       <= 1'b0;
@@ -98,6 +119,7 @@ module nebula_ptw (
                     discard <= 1'b0;
                     if (req_d || req_i) begin
                         for_d    <= req_d;
+                        asid     <= satp[59:44];
                         vpn      <= req_d ? vpn_d : vpn_i;
                         level    <= 2'd2;
                         pte_addr <= {satp[43:0], (req_d ? vpn_d[26:18] : vpn_i[26:18]), 3'b000};
@@ -106,7 +128,14 @@ module nebula_ptw (
                 end
 
                 P_READ: begin
-                    if (mem_req && mem_ack) begin
+                    if (!(pte_ok && pte_mem && pte_pmp)) begin
+                        // PTE fora da memória: access fault
+                        resp_vpn          <= vpn;
+                        resp_for_d        <= for_d;
+                        resp_page_fault   <= 1'b0;
+                        resp_access_fault <= 1'b1;
+                        state             <= P_RESP;
+                    end else if (mem_req && mem_ack) begin
                         pte <= mem_data;
                         resp_vpn   <= vpn;
                         resp_for_d <= for_d;
@@ -143,7 +172,13 @@ module nebula_ptw (
 
                 P_RESP: begin
                     resp_valid  <= 1'b1;
+                    resp_asid   <= asid;
                     resp_insert <= !resp_page_fault && !resp_access_fault && !discard && !flush;
+                    // walk descartado (SFENCE/troca de satp): não reporta faltas, o requisitante refaz
+                    if (discard || flush) begin
+                        resp_page_fault   <= 1'b0;
+                        resp_access_fault <= 1'b0;
+                    end
                     state       <= P_IDLE;
                 end
 

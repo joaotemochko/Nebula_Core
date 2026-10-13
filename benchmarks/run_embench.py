@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 ap = argparse.ArgumentParser()
-ap.add_argument('--sim', default=os.path.join(ROOT, 'build/sim/Vnebula_core_full'))
+ap.add_argument('--sim', default=os.path.join(ROOT, 'build/sim/Vnebula_cluster'))
 ap.add_argument('--dir', default=os.path.join(ROOT, 'build/embench'))
 ap.add_argument('--json', default=None)
 ap.add_argument('--extra', default='')

@@ -65,54 +65,67 @@ class NebulaCPU(CPU):
         self.platform.add_source_dir(rtl_dir)
 
         # =====================================================================
-        # Instância do nebula_core_axi_top
+        # Instância do nebula_axi_top (cluster Nebula + ponte AXI4 64 bits)
+        # Endereços AXI do núcleo têm 64 bits; o barramento LiteX tem 32.
         # =====================================================================
-        self.specials += Instance("nebula_core_axi_top",
-            i_clk   = ClockSignal("sys"),
-            i_rst_n = (ResetSignal("sys") == 0),
+        awaddr = Signal(64)
+        araddr = Signal(64)
+        self.comb += [
+            self.axi.aw.addr.eq(awaddr[:32]),
+            self.axi.ar.addr.eq(araddr[:32]),
+        ]
+        self.specials += Instance("nebula_axi_top",
+            p_NUM_CORES    = 1,
+            p_RESET_VECTOR = self.reset_address,
+            i_clk          = ClockSignal("sys"),
+            i_rst_n        = ~ResetSignal("sys"),
+            i_i_reset_vector   = self.reset_address,
+            i_i_timer_irq      = 0,
+            i_i_software_irq   = 0,
+            i_i_external_irq   = 0,
+            i_i_s_external_irq = 0,
 
-            i_i_timer_irq    = 0,
-            i_i_external_irq = 0,
-            i_i_software_irq = 0,
+            o_o_m_axi_awvalid = self.axi.aw.valid,
+            i_i_m_axi_awready = self.axi.aw.ready,
+            o_o_m_axi_awaddr  = awaddr,
+            o_o_m_axi_awid    = self.axi.aw.id,
+            o_o_m_axi_awlen   = self.axi.aw.len,
+            o_o_m_axi_awsize  = self.axi.aw.size,
+            o_o_m_axi_awburst = self.axi.aw.burst,
+            o_o_m_axi_awlock  = Signal(),
+            o_o_m_axi_awcache = Signal(4),
+            o_o_m_axi_awprot  = Signal(3),
+            o_o_m_axi_awqos   = Signal(4),
 
-            i_i_m_axi_i_arready = 0,
-            i_i_m_axi_i_rdata   = 0,
-            i_i_m_axi_i_rresp   = 0,
-            i_i_m_axi_i_rlast   = 0,
-            i_i_m_axi_i_rvalid  = 0,
+            o_o_m_axi_wvalid  = self.axi.w.valid,
+            i_i_m_axi_wready  = self.axi.w.ready,
+            o_o_m_axi_wdata   = self.axi.w.data,
+            o_o_m_axi_wstrb   = self.axi.w.strb,
+            o_o_m_axi_wlast   = self.axi.w.last,
 
-            o_o_m_axi_d_awvalid = self.axi.aw.valid,
-            i_i_m_axi_d_awready = self.axi.aw.ready,
-            o_o_m_axi_d_awaddr  = self.axi.aw.addr,
-            o_o_m_axi_d_awid    = self.axi.aw.id,
-            o_o_m_axi_d_awlen   = self.axi.aw.len,
-            o_o_m_axi_d_awsize  = self.axi.aw.size,
-            o_o_m_axi_d_awburst = self.axi.aw.burst,
+            i_i_m_axi_bvalid  = self.axi.b.valid,
+            o_o_m_axi_bready  = self.axi.b.ready,
+            i_i_m_axi_bresp   = self.axi.b.resp,
+            i_i_m_axi_bid     = self.axi.b.id,
 
-            o_o_m_axi_d_wvalid  = self.axi.w.valid,
-            i_i_m_axi_d_wready  = self.axi.w.ready,
-            o_o_m_axi_d_wdata   = self.axi.w.data,
-            o_o_m_axi_d_wstrb   = self.axi.w.strb,
-            o_o_m_axi_d_wlast   = self.axi.w.last,
+            o_o_m_axi_arvalid = self.axi.ar.valid,
+            i_i_m_axi_arready = self.axi.ar.ready,
+            o_o_m_axi_araddr  = araddr,
+            o_o_m_axi_arid    = self.axi.ar.id,
+            o_o_m_axi_arlen   = self.axi.ar.len,
+            o_o_m_axi_arsize  = self.axi.ar.size,
+            o_o_m_axi_arburst = self.axi.ar.burst,
+            o_o_m_axi_arlock  = Signal(),
+            o_o_m_axi_arcache = Signal(4),
+            o_o_m_axi_arprot  = Signal(3),
+            o_o_m_axi_arqos   = Signal(4),
 
-            i_i_m_axi_d_bvalid  = self.axi.b.valid,
-            o_o_m_axi_d_bready  = self.axi.b.ready,
-            i_i_m_axi_d_bresp   = self.axi.b.resp,
-            i_i_m_axi_d_bid     = self.axi.b.id,
-
-            o_o_m_axi_d_arvalid = self.axi.ar.valid,
-            i_i_m_axi_d_arready = self.axi.ar.ready,
-            o_o_m_axi_d_araddr  = self.axi.ar.addr,
-            o_o_m_axi_d_arid    = self.axi.ar.id,
-            o_o_m_axi_d_arlen   = self.axi.ar.len,
-            o_o_m_axi_d_arsize  = self.axi.ar.size,
-            o_o_m_axi_d_arburst = self.axi.ar.burst,
-
-            i_i_m_axi_d_rvalid  = self.axi.r.valid,
-            o_o_m_axi_d_rready  = self.axi.r.ready,
-            i_i_m_axi_d_rdata   = self.axi.r.data,
-            i_i_m_axi_d_rresp   = self.axi.r.resp,
-            i_i_m_axi_d_rlast   = self.axi.r.last,
+            i_i_m_axi_rvalid  = self.axi.r.valid,
+            o_o_m_axi_rready  = self.axi.r.ready,
+            i_i_m_axi_rdata   = self.axi.r.data,
+            i_i_m_axi_rresp   = self.axi.r.resp,
+            i_i_m_axi_rlast   = self.axi.r.last,
+            i_i_m_axi_rid     = self.axi.r.id,
         )
 
 CPUS[NebulaCPU.name] = NebulaCPU

@@ -31,6 +31,33 @@ package nebula_pkg;
     parameter int ASID_WIDTH  = 16;
 
     parameter int L1D_LINE_SIZE = 64;
+
+    // =========================================================================
+    // Mapa físico padrão (PMA) — SoC simulado (tb/sim/nebula_sim.cpp)
+    //   atributos: bit0 acessível, bit1 cacheável, bit2 executável
+    // =========================================================================
+    parameter int PMA_N = 8;
+    parameter logic [PMA_N-1:0][55:0] PMA_DEF_BASE = {
+        56'h0, 56'h0,
+        56'h0000_0080_000000,   // 5: RAM
+        56'h0000_0010_000000,   // 4: UART 16550
+        56'h0000_000C_000000,   // 3: PLIC
+        56'h0000_0002_000000,   // 2: CLINT
+        56'h0000_0000_100000,   // 1: finisher (sifive,test)
+        56'h0000_0000_001000    // 0: boot ROM
+    };
+    parameter logic [PMA_N-1:0][55:0] PMA_DEF_SIZE = {
+        56'h0, 56'h0,
+        56'h0000_0000_10000000 >> 0,  // 256 MB
+        56'h0000_0000_000100,
+        56'h0000_0000_400000,
+        56'h0000_0000_010000,
+        56'h0000_0000_001000,
+        56'h0000_0000_001000
+    };
+    parameter logic [PMA_N-1:0][2:0] PMA_DEF_ATTR = {
+        3'b000, 3'b000, 3'b111, 3'b001, 3'b001, 3'b001, 3'b001, 3'b101
+    };
     parameter int L2_LINE_SIZE  = 64;
 
     typedef logic [XLEN-1:0]        xreg_t;
@@ -138,6 +165,110 @@ package nebula_pkg;
     } fpu_op_t;
 
     // =========================================================================
+    // Triggers de debug (Sdtrig: mcontrol / mcontrol6, ação 0 = breakpoint)
+    // =========================================================================
+    parameter int NTRIG = 4;
+
+    typedef struct packed {
+        logic        valid;     // tipo mcontrol (2) ou mcontrol6 (6)
+        logic        is6;
+        logic        select;    // 1 = compara dado
+        logic        timing;    // 1 = após (só load-data)
+        logic [3:0]  action;
+        logic        chain;
+        logic [3:0]  match;
+        logic        m, s, u;
+        logic        ex, st, ld;
+        logic [63:0] tdata2;
+    } trig_t;
+
+    typedef struct packed {
+        logic                  fire;      // breakpoint (ação 0)
+        logic                  after;     // temporização "após"
+        logic [NTRIG-1:0][1:0] hit;       // valor de hit a gravar (0 = sem mudança)
+    } trig_res_t;
+
+    function automatic logic trig_simple(input trig_t t, input logic [63:0] v);
+        logic [63:0] mask;
+        int          c;
+        case (t.match)
+            4'd0: return v == t.tdata2;
+            4'd1: begin
+                c = 0;
+                for (int i = 0; i < 64; i++) if (t.tdata2[i] && c == i) c = i + 1;
+                mask = ~((64'd1 << (c + 1)) - 64'd1);
+                return (v & mask) == (t.tdata2 & mask);
+            end
+            4'd2: return v >= t.tdata2;
+            4'd3: return v < t.tdata2;
+            4'd4: return (v[31:0]  & t.tdata2[63:32]) == t.tdata2[31:0];
+            4'd5: return (v[63:32] & t.tdata2[63:32]) == t.tdata2[31:0];
+            default: return 1'b0;
+        endcase
+    endfunction
+
+    // op: 0 execute, 1 load, 2 store. Semântica do Spike (cadeia, hits, gating).
+    function automatic trig_res_t trig_check(input trig_t [NTRIG-1:0] tr, input logic [1:0] op,
+                                             input logic [63:0] addr, input logic [3:0] len,
+                                             input logic has_data, input logic [63:0] data,
+                                             input logic [1:0] priv, input logic mie, input logic sie,
+                                             input logic deleg_bp);
+        trig_res_t r;
+        logic chain_ok, m, opok, modeok, gate;
+        r = '0;
+        chain_ok = 1'b1;
+        for (int i = 0; i < NTRIG; i++) begin
+            if (!chain_ok) begin
+                chain_ok = !tr[i].chain;
+            end else begin
+                m = 1'b0;
+                opok   = (op == 2'd0) ? tr[i].ex : (op == 2'd1) ? tr[i].ld : tr[i].st;
+                modeok = (priv == 2'b11) ? tr[i].m : (priv == 2'b01) ? tr[i].s : tr[i].u;
+                gate   = 1'b1;
+                if (tr[i].action == 4'd0) begin
+                    if (priv == 2'b11 && !mie) gate = 1'b0;
+                    if (priv == 2'b01 && deleg_bp && !sie) gate = 1'b0;
+                end
+                if (tr[i].valid && opok && modeok && gate) begin
+                    if (!tr[i].select) begin
+                        for (int b = 0; b < 8; b++)
+                            if (4'(b) < len && trig_simple(tr[i], addr + 64'(b))) m = 1'b1;
+                    end else if (has_data) begin
+                        m = trig_simple(tr[i], data);
+                    end
+                end
+                if (m) r.hit[i] = (tr[i].is6 && tr[i].timing) ? 2'd3 : 2'd1;
+                if (m && !tr[i].chain && tr[i].action == 4'd0 && !r.fire) begin
+                    r.fire  = 1'b1;
+                    r.after = tr[i].timing;
+                end
+                chain_ok = m || !tr[i].chain;
+            end
+        end
+        return r;
+    endfunction
+
+    // =========================================================================
+    // AMO: novo valor a partir do antigo (valores já estendidos para 64 bits)
+    // =========================================================================
+    function automatic logic [63:0] amo_compute(input logic [4:0] op, input logic [63:0] old,
+                                                input logic [63:0] src);
+        logic signed [63:0] so, ss;
+        so = old; ss = src;
+        case (op)
+            5'b00001: return src;                              // SWAP
+            5'b00000: return old + src;                        // ADD
+            5'b00100: return old ^ src;                        // XOR
+            5'b01100: return old & src;                        // AND
+            5'b01000: return old | src;                        // OR
+            5'b10000: return (so < ss) ? old : src;            // MIN
+            5'b10100: return (so > ss) ? old : src;            // MAX
+            5'b11000: return (old < src) ? old : src;          // MINU
+            default:  return (old > src) ? old : src;          // MAXU
+        endcase
+    endfunction
+
+    // =========================================================================
     // Micro-op (saída do decodificador, carregada pelo pipeline)
     // =========================================================================
     typedef struct packed {
@@ -178,6 +309,8 @@ package nebula_pkg;
         // predição
         logic           pred_taken;
         logic [63:0]    pred_target;
+        // triggers de execução (hits a gravar no commit)
+        logic [NTRIG-1:0][1:0] trig_hit;
     } uop_t;
 
     // =========================================================================

@@ -12,9 +12,7 @@ import nebula_pkg::*;
  * entrada em trap (com delegação medeleg/mideleg e mtvec/stvec vetorizado),
  * MRET/SRET, cálculo de interrupção pendente e estado para MMU/decodificador.
  *
- * PMP não implementado (0 regiões: CSRs pmp* são ilegais). Contadores HPM leem zero.
- * Não implementados:
- * ASID em satp (Linux detecta e usa SFENCE.VMA global).
+ * PMP com 16 regiões (granularidade 4 B). Contadores HPM leem zero.
  */
 module nebula_csr #(
     parameter int HART_ID = 0
@@ -70,7 +68,19 @@ module nebula_csr #(
     output logic         tsr,
     output logic [1:0]   fs,
     output logic [2:0]   frm,
-    output logic         tlb_flush     // escrita em satp
+    output logic [15:0][7:0]  pmpcfg,
+    // triggers de debug
+    output trig_t [NTRIG-1:0] trig,
+    output logic         mie_out,
+    output logic         sie_out,
+    output logic         deleg_bp,
+    input  wire          trig_hit_we,
+    input  wire  [NTRIG-1:0][1:0] trig_hit_val,
+    output logic [15:0][53:0] pmpaddr,
+    output logic [15:0][57:0] pmp_lo,
+    output logic [15:0][57:0] pmp_hi,
+    output logic              pmp_any_locked,
+    output logic         tlb_flush     // escrita em satp (descarta walks em andamento)
 );
     // ---------------------------------------------------------------------
     // Registradores
@@ -95,6 +105,106 @@ module nebula_csr #(
     logic [63:0] mcycle_q, minstret_q;
     logic [4:0]  fflags_q;
     logic [2:0]  frm_q;
+    // triggers
+    logic [1:0]               tsel_q;
+    logic [NTRIG-1:0][1:0]    t_type;    // 0 desabilitado, 1 mcontrol, 2 mcontrol6
+    logic [NTRIG-1:0][1:0]    t_hit;
+    trig_t [NTRIG-1:0]        t_cfg;
+    always_comb begin
+        for (int i = 0; i < NTRIG; i++) begin
+            trig[i]       = t_cfg[i];
+            trig[i].valid = (t_type[i] != 2'd0);
+            trig[i].is6   = (t_type[i] == 2'd2);
+        end
+    end
+    assign mie_out  = st_mie;
+    assign sie_out  = st_sie;
+    assign deleg_bp = medeleg_q[3];
+
+    logic [63:0] tdata1_val;
+    always_comb begin
+        trig_t t;
+        t = t_cfg[tsel_q];
+        tdata1_val = '0;
+        case (t_type[tsel_q])
+            2'd1: begin
+                tdata1_val[63:60] = 4'd2;
+                tdata1_val[20]    = t_hit[tsel_q][0];
+                tdata1_val[19]    = t.select;
+                tdata1_val[18]    = t.timing;
+                tdata1_val[15:12] = t.action;
+                tdata1_val[11]    = t.chain;
+                tdata1_val[10:7]  = t.match;
+                tdata1_val[6]     = t.m;
+                tdata1_val[4]     = t.s;
+                tdata1_val[3]     = t.u;
+                tdata1_val[2]     = t.ex;
+                tdata1_val[1]     = t.st;
+                tdata1_val[0]     = t.ld;
+            end
+            2'd2: begin
+                tdata1_val[63:60] = 4'd6;
+                tdata1_val[25]    = t_hit[tsel_q][1];
+                tdata1_val[22]    = t_hit[tsel_q][0];
+                tdata1_val[21]    = t.select;
+                tdata1_val[15:12] = t.action;
+                tdata1_val[11]    = t.chain;
+                tdata1_val[10:7]  = t.match;
+                tdata1_val[6]     = t.m;
+                tdata1_val[4]     = t.s;
+                tdata1_val[3]     = t.u;
+                tdata1_val[2]     = t.ex;
+                tdata1_val[1]     = t.st;
+                tdata1_val[0]     = t.ld;
+            end
+            default: tdata1_val[63:60] = 4'd15;
+        endcase
+    end
+
+    logic [15:0][7:0]  pmpcfg_q;
+    logic [15:0][53:0] pmpaddr_q;
+    assign pmpcfg  = pmpcfg_q;
+    assign pmpaddr = pmpaddr_q;
+
+    // regiões PMP pré-decodificadas em intervalos [lo, hi); recalculadas
+    // somente após escrita em CSR de PMP (o flush do pipeline cobre o atraso)
+    logic [15:0][57:0] pmp_lo_q, pmp_hi_q;
+    logic              pmp_dirty, pmp_locked_q;
+    assign pmp_lo = pmp_lo_q;
+    assign pmp_hi = pmp_hi_q;
+    assign pmp_any_locked = pmp_locked_q;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pmp_lo_q <= '0; pmp_hi_q <= '0; pmp_locked_q <= 1'b0;
+        end else if (pmp_dirty) begin
+            logic lk;
+            lk = 1'b0;
+            for (int i = 0; i < 16; i++) begin
+                logic [57:0] base, sz, m;
+                if (pmpcfg_q[i][7] && pmpcfg_q[i][4:3] != 2'b00) lk = 1'b1;
+                case (pmpcfg_q[i][4:3])
+                    2'b01: begin
+                        pmp_lo_q[i] <= (i == 0) ? 58'd0 : {2'b00, pmpaddr_q[i-1], 2'b00};
+                        pmp_hi_q[i] <= {2'b00, pmpaddr_q[i], 2'b00};
+                    end
+                    2'b10: begin
+                        pmp_lo_q[i] <= {2'b00, pmpaddr_q[i], 2'b00};
+                        pmp_hi_q[i] <= {2'b00, pmpaddr_q[i], 2'b00} + 58'd4;
+                    end
+                    2'b11: begin
+                        m    = {3'b000, pmpaddr_q[i], 1'b1};
+                        sz   = ((m & ~(m + 58'd1)) + 58'd1) << 2;      // 2^(uns finais + 3)
+                        base = {2'b00, pmpaddr_q[i], 2'b00} & ~(sz - 58'd1);
+                        pmp_lo_q[i] <= base;
+                        pmp_hi_q[i] <= base + sz;
+                    end
+                    default: begin pmp_lo_q[i] <= '0; pmp_hi_q[i] <= '0; end
+                endcase
+            end
+            pmp_locked_q <= lk;
+        end
+    end
 
     localparam logic [63:0] MISA = 64'h8000_0000_0014_112D; // RV64 IMAFDC SU
     localparam logic [63:0] MEDELEG_MASK = 64'h0000_0000_000C_B3FE;
@@ -214,17 +324,24 @@ module nebula_csr #(
             12'h342: rdata = mcause_q;
             12'h343: rdata = mtval_q;
             12'h344: rdata = mip_val;
+            12'h3A0: rdata = pmpcfg_q[7:0];
+            12'h3A2: rdata = pmpcfg_q[15:8];
             12'hB00: rdata = mcycle_q;
             12'hB02: rdata = minstret_q;
             12'hF11, 12'hF12, 12'hF13, 12'hF15: rdata = '0;
             12'hF14: rdata = 64'(HART_ID);
-            12'h7A0: rdata = 64'd1;                  // tselect: nenhum trigger
-            12'h7A1, 12'h7A2, 12'h7A3: rdata = '0;   // tdata1-3
-            12'h7A4: rdata = 64'd1;                  // tinfo
+            12'h7A0: rdata = {62'b0, tsel_q};
+            12'h7A1: rdata = tdata1_val;
+            12'h7A2: rdata = t_cfg[tsel_q].tdata2;
+            12'h7A3: rdata = '0;                                     // tdata3 (textra): sem filtros
+            12'h7A4: rdata = 64'h0000_0000_0100_8044;                // tinfo: v1, tipos 2, 6, 15
             default: begin
                 if (csr_addr >= 12'hC03 && csr_addr <= 12'hC1F) rdata = '0;       // hpmcounter
                 else if (csr_addr >= 12'hB03 && csr_addr <= 12'hB1F) rdata = '0;  // mhpmcounter
                 else if (csr_addr >= 12'h323 && csr_addr <= 12'h33F) rdata = '0;  // mhpmevent
+                else if (csr_addr >= 12'h3B0 && csr_addr <= 12'h3BF) rdata = {10'b0, pmpaddr_q[csr_addr[3:0]]};
+                else if (csr_addr >= 12'h3C0 && csr_addr <= 12'h3EF) rdata = '0;  // pmpaddr16-63
+                else if (csr_addr >= 12'h3A4 && csr_addr <= 12'h3AE && !csr_addr[0]) rdata = '0; // pmpcfg4-14
                 else exists = 1'b0;
             end
         endcase
@@ -259,6 +376,11 @@ module nebula_csr #(
     end
 
     logic do_write;
+    assign pmp_dirty = do_write_q;
+    logic do_write_q;
+    always_ff @(posedge clk or negedge rst_n)
+        if (!rst_n) do_write_q <= 1'b0;
+        else        do_write_q <= do_write && (csr_addr[11:4] == 8'h3A || csr_addr[11:4] == 8'h3B);
     assign do_write = csr_commit && !csr_illegal && is_write;
     assign tlb_flush = do_write && (csr_addr == 12'h180);
 
@@ -330,10 +452,17 @@ module nebula_csr #(
             mcountinhibit_q <= '0;
             mcycle_q <= '0; minstret_q <= '0;
             fflags_q <= '0; frm_q <= '0;
+            pmpcfg_q <= '0; pmpaddr_q <= '0;
+            tsel_q <= '0; t_type <= '0; t_hit <= '0; t_cfg <= '0;
         end else begin
             // contadores
             if (!wr_mcycle && !mcountinhibit_q[0])   mcycle_q   <= mcycle_q + 64'd1;
             if (!wr_minstret && !mcountinhibit_q[2]) minstret_q <= minstret_q + 64'(instret_inc);
+
+            // hits de triggers (efetivados no WB)
+            if (trig_hit_we)
+                for (int i = 0; i < NTRIG; i++)
+                    if (trig_hit_val[i] != 2'd0) t_hit[i] <= (t_type[i] == 2'd1) ? 2'd1 : trig_hit_val[i];
 
             // FP
             if (|fflags_set) fflags_q <= fflags_q | fflags_set;
@@ -393,7 +522,7 @@ module nebula_csr #(
                     12'h144: if (mideleg_q[1]) mip_ssip <= wval[1];
                     12'h180: begin
                         if (wval[63:60] == 4'd0 || wval[63:60] == 4'd8)
-                            satp_q <= {wval[63:60], 16'b0, wval[43:0]};
+                            satp_q <= wval;
                     end
                     12'h300: begin
                         st_sie  <= wval[1];
@@ -426,9 +555,64 @@ module nebula_csr #(
                         mip_stip <= wval[5];
                         mip_seip <= wval[9];
                     end
+                    12'h3A0, 12'h3A2: begin
+                        for (int k = 0; k < 8; k++) begin
+                            int e;
+                            logic [7:0] nc;
+                            e  = (csr_addr == 12'h3A2) ? 8 + k : k;
+                            nc = wval[k*8 +: 8] & 8'h9F;
+                            if (!nc[0]) nc[1] = 1'b0;          // R=0,W=1 reservado
+                            if (!pmpcfg_q[e][7]) pmpcfg_q[e] <= nc;
+                        end
+                    end
+                    12'h7A0: if (wval < 64'(NTRIG)) tsel_q <= wval[1:0];
+                    12'h7A1: begin
+                        logic [3:0] act, mt;
+                        logic       sel, ld, ex;
+                        act = (wval[15:12] > 4'd4 || wval[15:12] == 4'd1) ? 4'd0 : wval[15:12];
+                        mt  = wval[10:7];
+                        ex  = wval[2];
+                        ld  = wval[0];
+                        t_cfg[tsel_q].action <= act;
+                        t_cfg[tsel_q].chain  <= wval[11];
+                        t_cfg[tsel_q].m  <= wval[6];
+                        t_cfg[tsel_q].s  <= wval[4];
+                        t_cfg[tsel_q].u  <= wval[3];
+                        t_cfg[tsel_q].ex <= ex;
+                        t_cfg[tsel_q].st <= wval[1];
+                        t_cfg[tsel_q].ld <= ld;
+                        if (wval[63:60] == 4'd2) begin
+                            sel = wval[19];
+                            t_type[tsel_q] <= 2'd1;
+                            t_hit[tsel_q]  <= {1'b0, wval[20]};
+                            t_cfg[tsel_q].select <= sel;
+                            t_cfg[tsel_q].timing <= (sel && ld) ? 1'b1 : ex ? 1'b0 : wval[18];
+                            // mcontrol: maskmax = 0 -> NAPOT legalizado para EQUAL
+                            t_cfg[tsel_q].match <= (mt == 4'd0 || mt == 4'd2 || mt == 4'd3 || mt == 4'd4 || mt == 4'd5) ? mt : 4'd0;
+                        end else if (wval[63:60] == 4'd6) begin
+                            sel = wval[21];
+                            t_type[tsel_q] <= 2'd2;
+                            t_hit[tsel_q]  <= {wval[25], wval[22]};
+                            t_cfg[tsel_q].select <= sel;
+                            t_cfg[tsel_q].timing <= sel && ld;
+                            t_cfg[tsel_q].match <= (mt <= 4'd5) ? mt : 4'd0;
+                        end else begin
+                            t_type[tsel_q] <= 2'd0;
+                            t_hit[tsel_q]  <= 2'd0;
+                        end
+                    end
+                    12'h7A2: t_cfg[tsel_q].tdata2 <= wval;
                     12'hB00: mcycle_q <= wval;
                     12'hB02: minstret_q <= wval;
-                    default: ;
+                    default: begin
+                        if (csr_addr >= 12'h3B0 && csr_addr <= 12'h3BF) begin
+                            logic [3:0] e;
+                            logic locked_next_tor;
+                            e = csr_addr[3:0];
+                            locked_next_tor = (e != 4'd15) && pmpcfg_q[e+1][7] && (pmpcfg_q[e+1][4:3] == 2'b01);
+                            if (!pmpcfg_q[e][7] && !locked_next_tor) pmpaddr_q[e] <= wval[53:0];
+                        end
+                    end
                 endcase
             end
         end

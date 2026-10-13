@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Executa a suíte riscv-tests (ISA) no simulador Verilator do Nebula Core.
 
-Uso: tb/run_isa_tests.py [--sim build/sim/Vnebula_core_full] [--tests DIR] [filtro...]
+Uso: tb/run_isa_tests.py [--sim build/sim/Vnebula_cluster] [--tests DIR] [filtro...]
 """
 import argparse, glob, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 ap = argparse.ArgumentParser()
-ap.add_argument('--sim', default=os.path.join(ROOT, 'build/sim/Vnebula_core_full'))
+ap.add_argument('--sim', default=os.path.join(ROOT, 'build/sim/Vnebula_cluster'))
 ap.add_argument('--tests', default=os.path.join(ROOT, 'build/riscv-tests/isa'))
 ap.add_argument('--extra', default='')
 ap.add_argument('-j', type=int, default=os.cpu_count())

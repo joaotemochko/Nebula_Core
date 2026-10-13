@@ -534,7 +534,7 @@ module nebula_fpu (
             l_sign <= 0; l_dbl <= 0; l_rm <= 0; l_exp <= 0;
         end else if (kill) begin
             state <= P_IDLE;
-        end else begin
+        end else if (start || state != P_IDLE) begin
             case (state)
                 P_IDLE: if (start) begin
                     unp_t ua, ub;
