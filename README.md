@@ -189,7 +189,7 @@ The FPU is fully IEEE 754-2008 compliant:
 # Clone the repository
 git clone https://github.com/yourusername/nebula-core.git
 cd nebula-core
-
+git submodule update --init --recursive
 # Run simulation (Verilator)
 make sim
 
